@@ -28,6 +28,7 @@
  */
 
 const mqtt = require('mqtt');
+const fs = require('fs');
 
 /**
  * Base class for HomeCore plugins written in Node.js.
@@ -56,6 +57,14 @@ class PluginBase {
     this.password   = password;
     /** @type {import('mqtt').MqttClient|null} */
     this._client = null;
+    this._startedAt = Date.now();
+    this._managementEnabled = false;
+    this._configPath = null;
+    this._version = null;
+    this._heartbeatTimer = null;
+    this._logForwardEnabled = false;
+    this._logForwardLevel = 'info';
+    this._logLevel = null;
   }
 
   // ---------------------------------------------------------------------------
@@ -196,6 +205,124 @@ class PluginBase {
     this._publish(topic, status, { retain: true, qos: 1 });
   }
 
+  /**
+   * Register a device with all optional fields.
+   *
+   * @param {string} deviceId        - Stable unique device identifier.
+   * @param {string} name            - Human-readable label.
+   * @param {object} [opts]          - Optional registration fields.
+   * @param {string} [opts.deviceType]    - Type name from the device-type catalog.
+   * @param {string} [opts.area]          - Room/zone assignment.
+   * @param {object} [opts.capabilities]  - JSON Schema object for device attributes.
+   */
+  registerDeviceFull(deviceId, name, { deviceType, area, capabilities } = {}) {
+    const topic = `homecore/plugins/${this.pluginId}/register`;
+    const msg = { device_id: deviceId, plugin_id: this.pluginId, name };
+    if (deviceType !== undefined) msg.device_type = deviceType;
+    if (area !== undefined) msg.area = area;
+    if (capabilities !== undefined) msg.capabilities = capabilities;
+    this._publish(topic, JSON.stringify(msg), { qos: 1 });
+  }
+
+  /**
+   * Publish a device capability schema (retained, QoS 1).
+   *
+   * @param {string} deviceId - Canonical HomeCore device identifier.
+   * @param {object} schema   - Capability schema object.
+   */
+  registerDeviceSchema(deviceId, schema) {
+    const topic = `homecore/devices/${deviceId}/schema`;
+    this._publish(topic, JSON.stringify(schema), { retain: true, qos: 1 });
+  }
+
+  /**
+   * Publish a structured event (QoS 1, not retained).
+   *
+   * @param {string} eventType - Event type identifier.
+   * @param {object} payload   - Event payload.
+   */
+  publishEvent(eventType, payload) {
+    const topic = `homecore/events/${eventType}`;
+    this._publish(topic, JSON.stringify(payload), { qos: 1 });
+  }
+
+  /**
+   * Enable the management protocol (heartbeat + command handling).
+   *
+   * @param {object} [opts]
+   * @param {number} [opts.intervalSecs=60] - Heartbeat interval in seconds.
+   * @param {string|null} [opts.version=null] - Plugin version string.
+   * @param {string|null} [opts.configPath=null] - Path to config file for get/set_config.
+   */
+  enableManagement({ intervalSecs = 60, version = null, configPath = null } = {}) {
+    this._managementEnabled = true;
+    this._version = version;
+    this._configPath = configPath;
+
+    // Subscribe to management commands
+    if (this._client) {
+      this._client.subscribe(`homecore/plugins/${this.pluginId}/manage/cmd`, { qos: 1 });
+    }
+
+    // Start heartbeat timer
+    this._heartbeatTimer = setInterval(() => {
+      const uptimeSecs = Math.floor((Date.now() - this._startedAt) / 1000);
+      const payload = {
+        timestamp: new Date().toISOString(),
+        version: this._version,
+        uptime_secs: uptimeSecs,
+      };
+      this._publish(
+        `homecore/plugins/${this.pluginId}/heartbeat`,
+        JSON.stringify(payload),
+        { qos: 1 },
+      );
+    }, intervalSecs * 1000);
+  }
+
+  /**
+   * Enable log forwarding to MQTT.
+   *
+   * @param {string} [minLevel='info'] - Minimum level to forward.
+   */
+  enableLogForwarding(minLevel = 'info') {
+    this._logForwardEnabled = true;
+    this._logForwardLevel = minLevel;
+  }
+
+  /**
+   * Forward a log line to MQTT (QoS 0, not retained).
+   *
+   * @param {string} level   - Log level (error, warn, info, debug, trace).
+   * @param {string} message - Log message.
+   * @param {object|null} [fields=null] - Optional structured fields.
+   */
+  forwardLog(level, message, fields = null) {
+    if (!this._logForwardEnabled) return;
+    if (PluginBase._logLevelValue(level) < PluginBase._logLevelValue(this._logForwardLevel)) return;
+    const payload = {
+      timestamp: new Date().toISOString(),
+      level: level.toUpperCase(),
+      target: this.pluginId,
+      message,
+      fields: fields || null,
+    };
+    this._publish(
+      `homecore/plugins/${this.pluginId}/logs`,
+      JSON.stringify(payload),
+      { qos: 0 },
+    );
+  }
+
+  /** Convenience: forward an info log. */
+  logInfo(msg, fields) { this.forwardLog('info', msg, fields); }
+  /** Convenience: forward a warn log. */
+  logWarn(msg, fields) { this.forwardLog('warn', msg, fields); }
+  /** Convenience: forward an error log. */
+  logError(msg, fields) { this.forwardLog('error', msg, fields); }
+  /** Convenience: forward a debug log. */
+  logDebug(msg, fields) { this.forwardLog('debug', msg, fields); }
+
   // ---------------------------------------------------------------------------
   // Subclass hooks
   // ---------------------------------------------------------------------------
@@ -294,6 +421,11 @@ class PluginBase {
         }
         this.onCommand(deviceId, payload);
       }
+
+      // Route management commands
+      if (this._managementEnabled && topic === `homecore/plugins/${this.pluginId}/manage/cmd`) {
+        this._handleManagementCmd(message);
+      }
     });
 
     this._client.on('error', (err) => {
@@ -319,6 +451,63 @@ class PluginBase {
     this._client.publish(topic, payload, opts, (err) => {
       if (err) console.error(`[${this.pluginId}] publish error on ${topic}:`, err.message);
     });
+  }
+
+  _handleManagementCmd(message) {
+    let cmd;
+    try {
+      cmd = JSON.parse(message.toString());
+    } catch {
+      return;
+    }
+    const responseTopic = `homecore/plugins/${this.pluginId}/manage/response`;
+    const requestId = cmd.request_id;
+
+    switch (cmd.action) {
+      case 'ping':
+        this._publish(responseTopic, JSON.stringify({ request_id: requestId, status: 'ok' }), { qos: 1 });
+        break;
+
+      case 'get_config':
+        if (this._configPath) {
+          try {
+            const data = fs.readFileSync(this._configPath, 'utf8');
+            this._publish(responseTopic, JSON.stringify({ request_id: requestId, status: 'ok', config: data }), { qos: 1 });
+          } catch (err) {
+            this._publish(responseTopic, JSON.stringify({ request_id: requestId, status: 'error', error: err.message }), { qos: 1 });
+          }
+        } else {
+          this._publish(responseTopic, JSON.stringify({ request_id: requestId, status: 'error', error: 'no config path configured' }), { qos: 1 });
+        }
+        break;
+
+      case 'set_config':
+        if (this._configPath) {
+          try {
+            fs.writeFileSync(this._configPath, typeof cmd.config === 'string' ? cmd.config : JSON.stringify(cmd.config), 'utf8');
+            this._publish(responseTopic, JSON.stringify({ request_id: requestId, status: 'ok' }), { qos: 1 });
+          } catch (err) {
+            this._publish(responseTopic, JSON.stringify({ request_id: requestId, status: 'error', error: err.message }), { qos: 1 });
+          }
+        } else {
+          this._publish(responseTopic, JSON.stringify({ request_id: requestId, status: 'error', error: 'no config path configured' }), { qos: 1 });
+        }
+        break;
+
+      case 'set_log_level':
+        this._logLevel = cmd.level;
+        this._publish(responseTopic, JSON.stringify({ request_id: requestId, status: 'ok' }), { qos: 1 });
+        break;
+
+      default:
+        this._publish(responseTopic, JSON.stringify({ request_id: requestId, status: 'error', error: `unknown action: ${cmd.action}` }), { qos: 1 });
+        break;
+    }
+  }
+
+  static _logLevelValue(level) {
+    const map = { trace: 1, debug: 2, info: 3, warn: 4, error: 5 };
+    return map[(level || '').toLowerCase()] || 0;
   }
 
   _withStateChangeMetadata(payload, change) {
