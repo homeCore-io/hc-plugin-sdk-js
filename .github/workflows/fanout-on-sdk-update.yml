@@ -15,14 +15,19 @@ name: Fan out SDK updates
 # Auth: needs SDK_FANOUT_PAT — same shape as the Rust SDK's PAT.
 
 on:
-  push:
-    branches: [develop]
-    paths:
-      - 'index.js'
-      - 'lib/**'
-      - 'src/**'
-      - 'package.json'
-      - 'package-lock.json'
+  # push trigger disabled until the first JS plugin lands. With an
+  # empty matrix below, GitHub Actions spawns zero jobs on push and
+  # marks the run as failed (matrix expansion happens before the
+  # `if: vars.FANOUT_ENABLED` gate). When the first JS plugin lands,
+  # restore the push block:
+  #   push:
+  #     branches: [develop]
+  #     paths:
+  #       - 'index.js'
+  #       - 'lib/**'
+  #       - 'src/**'
+  #       - 'package.json'
+  #       - 'package-lock.json'
   workflow_dispatch: {}
 
 permissions:
