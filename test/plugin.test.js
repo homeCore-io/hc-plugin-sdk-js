@@ -788,3 +788,120 @@ describe('streaming actions', () => {
     await expect(pending).resolves.toEqual({ pin: '1234' });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Device persistence
+// ---------------------------------------------------------------------------
+
+const fsMod = require('fs');
+const osMod = require('os');
+const pathMod = require('path');
+const { scopedSnapshotPath } = require('../index');
+
+describe('device persistence', () => {
+  let mockClient;
+  let dir;
+  let snapPath;
+
+  beforeEach(() => {
+    mockClient = {
+      on: jest.fn(), subscribe: jest.fn(), unsubscribe: jest.fn(), publish: jest.fn(),
+    };
+    mqtt.connect.mockReturnValue(mockClient);
+    dir = fsMod.mkdtempSync(pathMod.join(osMod.tmpdir(), 'hcsdk-'));
+    snapPath = pathMod.join(dir, '.published-device-ids.json');
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+    fsMod.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const plugin = () => { const p = new TestPlugin(); p.run(); return p; };
+  const scoped = () => snapPath.replace('.json', '.plugin.test.json');
+
+  // Real deployments keep every plugin's config in one directory, and every
+  // plugin derives this path the same way — unscoped they share one file and
+  // retire each other's devices.
+  test('the snapshot path is scoped to the plugin', () => {
+    const hue = scopedSnapshotPath('/cfg/.published-device-ids.json', 'plugin.hue');
+    const sonos = scopedSnapshotPath('/cfg/.published-device-ids.json', 'plugin.sonos');
+    expect(hue).not.toBe(sonos);
+    expect(hue.endsWith('.published-device-ids.plugin.hue.json')).toBe(true);
+  });
+
+  test('scoping is idempotent', () => {
+    const once = scopedSnapshotPath('/cfg/.published-device-ids.json', 'plugin.hue');
+    expect(scopedSnapshotPath(once, 'plugin.hue')).toBe(once);
+  });
+
+  test('registered devices are written to disk', () => {
+    const p = plugin();
+    p.enableDevicePersistence(snapPath);
+    p.registerDeviceTyped('light.01', 'One', 'light');
+    p.registerDeviceTyped('light.02', 'Two', 'light');
+    expect(JSON.parse(fsMod.readFileSync(scoped(), 'utf8'))).toEqual(['light.01', 'light.02']);
+  });
+
+  test('a new process remembers the previous run', () => {
+    const first = plugin();
+    first.enableDevicePersistence(snapPath);
+    first.registerDeviceTyped('light.01', 'One', 'light');
+
+    const second = plugin();
+    second.enableDevicePersistence(snapPath);
+    expect(second._devices.has('light.01')).toBe(true);
+  });
+
+  test('reconcile unregisters what vanished', () => {
+    const p = plugin();
+    p.enableDevicePersistence(snapPath);
+    p.registerDeviceTyped('light.01', 'One', 'light');
+    p.registerDeviceTyped('light.02', 'Two', 'light');
+
+    const report = p.reconcileDevices(['light.01']);
+    expect(report.staleUnregistered).toEqual(['light.02']);
+    expect(report.unknownInLive).toEqual([]);
+    expect(p._devices.has('light.02')).toBe(false);
+    expect(p._devices.has('light.01')).toBe(true);
+  });
+
+  // The whole point of persisting: a device dropped while the plugin was down
+  // is invisible to a fresh process without the snapshot.
+  test('reconcile retires a device from an earlier run', () => {
+    const first = plugin();
+    first.enableDevicePersistence(snapPath);
+    first.registerDeviceTyped('light.gone', 'Gone', 'light');
+
+    const second = plugin();
+    second.enableDevicePersistence(snapPath);
+    expect(second.reconcileDevices([]).staleUnregistered).toEqual(['light.gone']);
+  });
+
+  test('reconcile reports ids it never registered', () => {
+    const p = plugin();
+    p.enableDevicePersistence(snapPath);
+    const report = p.reconcileDevices(['light.surprise']);
+    expect(report.unknownInLive).toEqual(['light.surprise']);
+    expect(report.staleUnregistered).toEqual([]);
+  });
+
+  test('a corrupt snapshot is survivable', () => {
+    // Losing the snapshot costs reconcile, not the plugin.
+    fsMod.writeFileSync(scoped(), '{not json');
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const p = plugin();
+    p.enableDevicePersistence(snapPath);
+    expect(warn).toHaveBeenCalled();
+    p.registerDeviceTyped('light.01', 'One', 'light');
+    expect(p._devices.has('light.01')).toBe(true);
+    warn.mockRestore();
+  });
+
+  test('persistence is optional', () => {
+    const p = plugin();
+    p.registerDeviceTyped('light.01', 'One', 'light');
+    expect(p._devices.has('light.01')).toBe(true);
+    expect(fsMod.existsSync(scoped())).toBe(false);
+  });
+});
