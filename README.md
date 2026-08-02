@@ -8,13 +8,34 @@ Extend `PluginBase`, say what your devices are, handle commands. The SDK covers
 the MQTT connection, registration, the management protocol, notices, and
 capability actions.
 
+## Installing
+
+Requires Node.js 18+.
+
+### Working inside the homeCore workspace
+
+This is the normal case today. If you cloned the whole workspace — `core/`,
+`plugins/`, `sdks/` side by side — install from the checkout. Your plugin then
+picks up SDK edits with no commit, tag, or reinstall in between, which is what
+you want while developing the two together.
+
+```bash
+# from your plugin's directory, e.g. plugins/hc-mything/
+npm install ../../sdks/hc-plugin-sdk-js
+```
+
+npm records this as `file:../../sdks/hc-plugin-sdk-js` — relative, so the
+`package.json` stays valid for anyone else with the same workspace layout — and
+links the directory rather than copying it, so SDK edits are live immediately.
+
+### From a release
+
 ```bash
 npm install github:homeCore-io/hc-plugin-sdk-js#v0.2.0
 ```
 
-Requires Node.js 18+.
-
-Not on npm yet — install from the tag, which pins you to a known release the
+**Nothing is published to npm**, so there is no `npm install
+homecore-plugin-sdk`. Installing from the tag pins you to a known release the
 same way the Rust SDK's git dependency does.
 
 ## Your first plugin
