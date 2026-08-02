@@ -9,10 +9,13 @@ the MQTT connection, registration, the management protocol, notices, and
 capability actions.
 
 ```bash
-npm install homecore-plugin-sdk
+npm install github:homeCore-io/hc-plugin-sdk-js#v0.2.0
 ```
 
 Requires Node.js 18+.
+
+Not on npm yet — install from the tag, which pins you to a known release the
+same way the Rust SDK's git dependency does.
 
 ## Your first plugin
 
