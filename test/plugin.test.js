@@ -27,9 +27,10 @@ describe('PluginBase', () => {
 
   beforeEach(() => {
     mockClient = {
-      on:        jest.fn(),
-      subscribe: jest.fn(),
-      publish:   jest.fn(),
+      on:          jest.fn(),
+      subscribe:   jest.fn(),
+      unsubscribe: jest.fn(),
+      publish:     jest.fn(),
     };
     mqtt.connect.mockReturnValue(mockClient);
   });
@@ -68,13 +69,29 @@ describe('PluginBase', () => {
     expect(opts).not.toHaveProperty('password');
   });
 
-  test('run() subscribes to cmd wildcard on connect', () => {
+  test('registering a device subscribes to that device only', () => {
     const plugin = new TestPlugin();
     plugin.run();
+    plugin.registerDeviceTyped('light.01', 'One', 'light');
+    expect(mockClient.subscribe).toHaveBeenCalledWith(
+      'homecore/devices/light.01/cmd',
+      { qos: 1 },
+    );
+    expect(mockClient.subscribe).not.toHaveBeenCalledWith(
+      'homecore/devices/+/cmd',
+      expect.anything(),
+    );
+  });
+
+  test('reconnect re-subscribes to the devices already known', () => {
+    const plugin = new TestPlugin();
+    plugin.run();
+    plugin.registerDeviceTyped('light.01', 'One', 'light');
+    mockClient.subscribe.mockClear();
     const connectHandler = mockClient.on.mock.calls.find(([e]) => e === 'connect')[1];
     connectHandler();
     expect(mockClient.subscribe).toHaveBeenCalledWith(
-      'homecore/devices/+/cmd',
+      'homecore/devices/light.01/cmd',
       { qos: 1 },
     );
   });
@@ -302,6 +319,7 @@ describe('PluginBase', () => {
   test('onCommand is called when a cmd message arrives', () => {
     const plugin = new TestPlugin();
     plugin.run();
+    plugin.subscribeCommands('light.01');
     const messageHandler = mockClient.on.mock.calls.find(([e]) => e === 'message')[1];
     messageHandler(
       'homecore/devices/light.01/cmd',
@@ -314,6 +332,7 @@ describe('PluginBase', () => {
   test('invalid JSON in cmd payload is handled gracefully', () => {
     const plugin = new TestPlugin();
     plugin.run();
+    plugin.subscribeCommands('light.01');
     const messageHandler = mockClient.on.mock.calls.find(([e]) => e === 'message')[1];
     messageHandler('homecore/devices/light.01/cmd', Buffer.from('not-json'));
     expect(plugin.commands).toHaveLength(1);
@@ -389,5 +408,383 @@ describe('PluginBase', () => {
     const plugin = new TestPlugin();
     const result = plugin.run();
     expect(result).toBe(mockClient);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Isolation
+// ---------------------------------------------------------------------------
+
+describe('device isolation', () => {
+  let mockClient;
+
+  beforeEach(() => {
+    mockClient = {
+      on: jest.fn(), subscribe: jest.fn(), unsubscribe: jest.fn(), publish: jest.fn(),
+    };
+    mqtt.connect.mockReturnValue(mockClient);
+  });
+  afterEach(() => jest.clearAllMocks());
+
+  const handlerFor = () => mockClient.on.mock.calls.find(([e]) => e === 'message')[1];
+
+  // The SDK used to subscribe to `homecore/devices/+/cmd`, so every plugin saw
+  // every other plugin's commands and could act on them.
+  test('a command for another plugin device is ignored', () => {
+    const plugin = new TestPlugin();
+    plugin.run();
+    plugin.registerDeviceTyped('light.mine', 'Mine', 'light');
+    handlerFor()('homecore/devices/light.theirs/cmd', Buffer.from('{"on":true}'));
+    expect(plugin.commands).toHaveLength(0);
+  });
+
+  test('unregistering stops delivery', () => {
+    const plugin = new TestPlugin();
+    plugin.run();
+    plugin.registerDeviceTyped('light.01', 'One', 'light');
+    plugin.unregisterDevice('light.01');
+    handlerFor()('homecore/devices/light.01/cmd', Buffer.from('{"on":true}'));
+    expect(plugin.commands).toHaveLength(0);
+    expect(mockClient.unsubscribe).toHaveBeenCalledWith('homecore/devices/light.01/cmd');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Notices
+// ---------------------------------------------------------------------------
+
+const { PluginNotice, NoticeLevel, Capabilities, Action, StreamContext, StreamTerminated } = require('../index');
+
+describe('notices', () => {
+  let mockClient;
+  const beats = () => mockClient.publish.mock.calls
+    .filter(([t]) => t.endsWith('/heartbeat'))
+    .map(([, p]) => JSON.parse(p));
+
+  beforeEach(() => {
+    mockClient = {
+      on: jest.fn(), subscribe: jest.fn(), unsubscribe: jest.fn(), publish: jest.fn(),
+    };
+    mqtt.connect.mockReturnValue(mockClient);
+  });
+  afterEach(() => jest.clearAllMocks());
+
+  const managed = () => {
+    const plugin = new TestPlugin();
+    plugin.run();
+    plugin.enableManagement({ intervalSecs: 3600 });
+    return plugin;
+  };
+
+  test('raise and clear', () => {
+    const plugin = managed();
+    plugin.notices.raise(PluginNotice.error('bridge_unreachable', 'gone'));
+    expect(plugin.notices.has('bridge_unreachable')).toBe(true);
+    plugin.notices.clear('bridge_unreachable');
+    expect(plugin.notices.has('bridge_unreachable')).toBe(false);
+  });
+
+  test('clearing something not raised is a no-op and does not republish', () => {
+    const plugin = managed();
+    const before = mockClient.publish.mock.calls.length;
+    plugin.notices.clear('never_raised');
+    expect(mockClient.publish.mock.calls.length).toBe(before);
+  });
+
+  test('re-raising a code replaces it', () => {
+    const plugin = managed();
+    plugin.notices.raise(PluginNotice.warning('c', 'first'));
+    plugin.notices.raise(PluginNotice.error('c', 'second'));
+    expect(plugin.notices.size).toBe(1);
+    expect(plugin.notices.snapshot()[0].message).toBe('second');
+    expect(plugin.notices.snapshot()[0].level).toBe(NoticeLevel.ERROR);
+  });
+
+  test('wire form omits remedy when absent', () => {
+    const plugin = managed();
+    plugin.notices.set([
+      PluginNotice.info('a', 'no remedy'),
+      PluginNotice.info('b', 'has one', { remedy: 'do this' }),
+    ]);
+    const wire = Object.fromEntries(plugin.notices.toWire().map((n) => [n.code, n]));
+    expect(wire.a.remedy).toBeUndefined();
+    expect(wire.b.remedy).toBe('do this');
+    expect(wire.a.level).toBe('info');
+  });
+
+  test('a change publishes a heartbeat immediately', () => {
+    const plugin = managed();
+    const before = beats().length;
+    plugin.notices.raise(PluginNotice.warning('c', 'm'));
+    const after = beats();
+    expect(after.length).toBe(before + 1);
+    expect(after[after.length - 1].notices[0].code).toBe('c');
+  });
+
+  test('re-deriving the same set does not republish', () => {
+    const plugin = managed();
+    plugin.notices.set([PluginNotice.warning('c', 'm')]);
+    const before = mockClient.publish.mock.calls.length;
+    plugin.notices.set([PluginNotice.warning('c', 'm')]);
+    expect(mockClient.publish.mock.calls.length).toBe(before);
+  });
+
+  test('a cleared notice leaves the next heartbeat', () => {
+    const plugin = managed();
+    plugin.notices.raise(PluginNotice.error('gone', 'transient'));
+    plugin.notices.clear('gone');
+    const last = beats().pop();
+    expect(last.notices).toEqual([]);
+  });
+
+  test('heartbeat carries device_count and versions', () => {
+    const plugin = managed();
+    plugin.registerDeviceTyped('light.01', 'One', 'light');
+    plugin._publishHeartbeat();
+    const hb = beats().pop();
+    expect(hb.device_count).toBe(1);
+    expect(hb.protocol_version).toBeDefined();
+    expect(hb.sdk_version).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Capability actions
+// ---------------------------------------------------------------------------
+
+class ActionPlugin extends TestPlugin {
+  constructor(options) {
+    super(options);
+    this.seen = [];
+  }
+
+  onAction(action, params, ctx) {
+    this.seen.push([action, params]);
+    if (action === 'immediate') return { echo: params };
+    if (action === 'boom') throw new Error('handler exploded');
+    if (action === 'slow') return Promise.resolve({ ok: true });
+    if (action === 'sweep') {
+      ctx.progress({ percent: 50, message: 'halfway' });
+      ctx.itemAdd({ serial: 'abc' });
+      ctx.complete({ found: 1 });
+      return null;
+    }
+    if (action === 'silent') return null;  // streaming handler that never terminates
+    return null;
+  }
+}
+
+describe('capability actions', () => {
+  let mockClient;
+
+  const responses = () => mockClient.publish.mock.calls
+    .filter(([t]) => t.endsWith('/manage/response'))
+    .map(([, p]) => JSON.parse(p));
+  const streamEvents = () => mockClient.publish.mock.calls
+    .filter(([t]) => t.includes('/commands/') && arguments)
+    .filter(([, p]) => p !== '')
+    .map(([, p]) => JSON.parse(p));
+
+  beforeEach(() => {
+    mockClient = {
+      on: jest.fn(), subscribe: jest.fn(), unsubscribe: jest.fn(), publish: jest.fn(),
+    };
+    mqtt.connect.mockReturnValue(mockClient);
+  });
+  afterEach(() => jest.clearAllMocks());
+
+  const setup = (actions) => {
+    const plugin = new ActionPlugin();
+    plugin.run();
+    plugin.enableManagement({
+      intervalSecs: 3600,
+      capabilities: new Capabilities(actions),
+    });
+    return plugin;
+  };
+
+  const send = (plugin, body) => {
+    const handler = mockClient.on.mock.calls.find(([e]) => e === 'message')[1];
+    handler(
+      'homecore/plugins/plugin.test/manage/cmd',
+      Buffer.from(JSON.stringify({ request_id: 'r1', ...body })),
+    );
+  };
+
+  test('the manifest is published retained', () => {
+    setup([new Action({ id: 'immediate', label: 'Do it', description: 'desc' })]);
+    const call = mockClient.publish.mock.calls.find(([t]) => t.endsWith('/capabilities'));
+    expect(call).toBeDefined();
+    expect(call[2]).toEqual({ qos: 1, retain: true });
+    const manifest = JSON.parse(call[1]);
+    expect(manifest.spec).toBe('1');
+    expect(manifest.plugin_id).toBe('plugin.test');
+    expect(manifest.actions[0].id).toBe('immediate');
+    expect(manifest.actions[0].requires_role).toBe('user');
+    // Absent optionals are omitted, not null — matching Rust.
+    expect(manifest.actions[0].params).toBeUndefined();
+  });
+
+  test('an immediate action returns its result', async () => {
+    const plugin = setup([new Action({ id: 'immediate', label: 'Do it' })]);
+    send(plugin, { action: 'immediate', value: 7 });
+    await Promise.resolve();
+    const resp = responses().pop();
+    expect(resp.status).toBe('ok');
+    expect(resp.echo).toEqual({ value: 7 });
+    expect(resp.echo.action).toBeUndefined();
+  });
+
+  test('an async handler is awaited', async () => {
+    const plugin = setup([new Action({ id: 'slow', label: 'Slow' })]);
+    send(plugin, { action: 'slow' });
+    await new Promise((r) => setImmediate(r));
+    expect(responses().pop()).toMatchObject({ status: 'ok', ok: true });
+  });
+
+  test('an unknown action is an error', async () => {
+    const plugin = setup([new Action({ id: 'immediate', label: 'Do it' })]);
+    send(plugin, { action: 'nope' });
+    await new Promise((r) => setImmediate(r));
+    const resp = responses().pop();
+    expect(resp.status).toBe('error');
+    expect(resp.error).toMatch(/unknown action/);
+  });
+
+  test('a throwing handler becomes an error response, not a crash', async () => {
+    const plugin = setup([new Action({ id: 'boom', label: 'Boom' })]);
+    send(plugin, { action: 'boom' });
+    await new Promise((r) => setImmediate(r));
+    const resp = responses().pop();
+    expect(resp.status).toBe('error');
+    expect(resp.error).toMatch(/handler exploded/);
+  });
+
+  test('get_config answers with the `data` key core reads', () => {
+    const plugin = setup([]);
+    const fsMod = require('fs');
+    jest.spyOn(fsMod, 'readFileSync').mockReturnValue('a = 1\n');
+    plugin._configPath = '/tmp/whatever.toml';
+    send(plugin, { action: 'get_config' });
+    expect(responses().pop()).toMatchObject({ status: 'ok', data: 'a = 1\n' });
+    fsMod.readFileSync.mockRestore();
+  });
+});
+
+describe('streaming actions', () => {
+  let mockClient;
+
+  const responses = () => mockClient.publish.mock.calls
+    .filter(([t]) => t.endsWith('/manage/response'))
+    .map(([, p]) => JSON.parse(p));
+  const streamCalls = () => mockClient.publish.mock.calls
+    .filter(([t]) => t.includes('/commands/'));
+
+  beforeEach(() => {
+    mockClient = {
+      on: jest.fn(), subscribe: jest.fn(), unsubscribe: jest.fn(), publish: jest.fn(),
+    };
+    mqtt.connect.mockReturnValue(mockClient);
+  });
+  afterEach(() => jest.clearAllMocks());
+
+  const setup = () => {
+    const plugin = new ActionPlugin();
+    plugin.run();
+    plugin.enableManagement({
+      intervalSecs: 3600,
+      capabilities: new Capabilities([
+        new Action({ id: 'sweep', label: 'Sweep', stream: true, itemKey: 'serial' }),
+        new Action({ id: 'silent', label: 'Silent', stream: true }),
+      ]),
+    });
+    return plugin;
+  };
+
+  const run = async (plugin, action) => {
+    const handler = mockClient.on.mock.calls.find(([e]) => e === 'message')[1];
+    handler(
+      'homecore/plugins/plugin.test/manage/cmd',
+      Buffer.from(JSON.stringify({ action, request_id: 'r1' })),
+    );
+    // Let the promise chain in _startStream settle.
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+  };
+
+  test('answers accepted with the stream topic', async () => {
+    const plugin = setup();
+    await run(plugin, 'sweep');
+    const resp = responses()[0];
+    expect(resp.status).toBe('accepted');
+    expect(resp.stream_topic).toBe('homecore/plugins/plugin.test/commands/r1/events');
+  });
+
+  test('stages are emitted in order, each with request_id and ts', async () => {
+    const plugin = setup();
+    await run(plugin, 'sweep');
+    const events = streamCalls().filter(([, p]) => p !== '').map(([, p]) => JSON.parse(p));
+    expect(events.map((e) => e.stage)).toEqual(['progress', 'item', 'complete']);
+    for (const e of events) {
+      expect(e.request_id).toBe('r1');
+      expect(e.ts).toBeDefined();
+    }
+  });
+
+  test('the stream topic is retained-cleared at the end', async () => {
+    const plugin = setup();
+    await run(plugin, 'sweep');
+    const last = streamCalls().pop();
+    expect(last[1]).toBe('');
+    expect(last[2]).toEqual({ qos: 1, retain: true });
+  });
+
+  test('a handler that never terminates gets a synthetic error', async () => {
+    const plugin = setup();
+    await run(plugin, 'silent');
+    const events = streamCalls().filter(([, p]) => p !== '').map(([, p]) => JSON.parse(p));
+    const last = events.pop();
+    expect(last.stage).toBe('error');
+    expect(last.data.reason).toBe('plugin_dropped_stream');
+  });
+
+  test('emitting after a terminal stage throws', () => {
+    const plugin = setup();
+    const ctx = new StreamContext(plugin, 'r9', 'sweep');
+    ctx.complete({});
+    expect(() => ctx.progress({ message: 'too late' })).toThrow(StreamTerminated);
+  });
+
+  test('cancel routes to the live stream', () => {
+    const plugin = setup();
+    const ctx = new StreamContext(plugin, 'r5', 'sweep');
+    plugin._activeStreams.set('r5', ctx);
+    const handler = mockClient.on.mock.calls.find(([e]) => e === 'message')[1];
+    handler('homecore/plugins/plugin.test/manage/cmd', Buffer.from(JSON.stringify({
+      action: 'cancel', request_id: 'r6', target_request_id: 'r5',
+    })));
+    expect(ctx.isCanceled()).toBe(true);
+    expect(responses().pop().status).toBe('ok');
+  });
+
+  test('cancel for an unknown stream is an error', () => {
+    const plugin = setup();
+    const handler = mockClient.on.mock.calls.find(([e]) => e === 'message')[1];
+    handler('homecore/plugins/plugin.test/manage/cmd', Buffer.from(JSON.stringify({
+      action: 'cancel', request_id: 'r6', target_request_id: 'nope',
+    })));
+    expect(responses().pop().status).toBe('error');
+  });
+
+  test('respond resolves awaitRespond', async () => {
+    const plugin = setup();
+    const ctx = new StreamContext(plugin, 'r7', 'pair');
+    plugin._activeStreams.set('r7', ctx);
+    const pending = ctx.awaitRespond(2000);
+    const handler = mockClient.on.mock.calls.find(([e]) => e === 'message')[1];
+    handler('homecore/plugins/plugin.test/manage/cmd', Buffer.from(JSON.stringify({
+      action: 'respond', request_id: 'r8', target_request_id: 'r7', response: { pin: '1234' },
+    })));
+    await expect(pending).resolves.toEqual({ pin: '1234' });
   });
 });
