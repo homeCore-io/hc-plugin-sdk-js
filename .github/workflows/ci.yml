@@ -1,0 +1,40 @@
+# CI for the Node.js plugin SDK.
+#
+# `npm ci` rather than `npm install`, so the committed lockfile is what gets
+# tested and a run cannot silently drift onto newer transitive versions.
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: install + test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor declared in package.json engines, and current LTS.
+        node-version: ["18", "22"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Require it
+        # Catches a broken `main` or a file renamed without package.json
+        # following — the package installs, and then nothing can load it.
+        run: node -e "require('./index.js')"
+
+      - run: npm test
