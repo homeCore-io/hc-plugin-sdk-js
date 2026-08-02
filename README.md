@@ -314,7 +314,8 @@ streaming, and cross-device state subscription.
 
 Not here: device persistence and `reconcileDevices`, the Rust SDK's helper for
 unregistering devices that disappeared from your upstream while the plugin was
-down. Track your own set and call `unregisterDevice` if you need it.
+down. Track your own set and call `unregisterDevice` if you need it. That is the
+only gap, and it is the same one in the Python and .NET SDKs.
 
 ## Development
 
