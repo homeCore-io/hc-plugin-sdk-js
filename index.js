@@ -35,6 +35,7 @@ const {
   Action, Capabilities, Concurrency, ItemOp, RequiresRole,
 } = require('./lib/capabilities');
 const { StreamContext, StreamTerminated } = require('./lib/streaming');
+const { DeviceTracker, scopedSnapshotPath } = require('./lib/persistence');
 
 /**
  * This SDK's version, reported in every heartbeat. Informational — it tells an
@@ -93,9 +94,11 @@ class PluginBase {
      */
     this.notices = new PluginNotices(() => this._onNoticesChanged());
 
-    // Devices this plugin has registered. Drives the heartbeat's device_count
-    // and, more importantly, decides which command topics we subscribe to.
-    this._devices = new Set();
+    // Devices this plugin has registered. Drives the heartbeat's device_count,
+    // decides which command topics we subscribe to, and — once persistence is
+    // enabled — survives a restart so reconcileDevices can tell what has since
+    // disappeared.
+    this._devices = new DeviceTracker();
     this._capabilities = null;
     this._activeStreams = new Map();
   }
@@ -189,6 +192,60 @@ class PluginBase {
   /** Stop receiving commands for one device. */
   unsubscribeCommands(deviceId) {
     if (this._client) this._client.unsubscribe(`homecore/devices/${deviceId}/cmd`);
+  }
+
+  /**
+   * Remember across restarts which devices this plugin registered.
+   *
+   * Call once at startup, before registering anything. The plugin id is
+   * inserted into the filename, so plugins sharing a config directory cannot
+   * share a snapshot and retire each other's devices.
+   *
+   * Without this, {@link PluginBase#reconcileDevices} can only see devices
+   * registered in the *current* process, so anything dropped while the plugin
+   * was down lingers in homeCore forever.
+   *
+   * @param {string} p - Typically `<configDir>/.published-device-ids.json`.
+   */
+  enableDevicePersistence(p) {
+    this._devices.enablePersistence(scopedSnapshotPath(p, this.pluginId));
+  }
+
+  /**
+   * Unregister every device this plugin knows about that is not in `live`.
+   *
+   * The "set what is live this cycle, let the SDK clean up the rest" workflow.
+   * Combined with {@link PluginBase#enableDevicePersistence} it also retires
+   * devices registered in earlier runs.
+   *
+   * **Only call this after a sync you trust.** On a partial fetch it will
+   * unregister live devices behind a temporarily unreachable upstream. Track an
+   * "everything succeeded" flag across your per-source loop and pass the live
+   * set only when it holds.
+   *
+   * Ids in `live` that were never registered are reported in `unknownInLive`
+   * and otherwise ignored — register them first if you meant to keep them.
+   *
+   * @param {Iterable<string>} live
+   * @returns {{staleUnregistered: string[], unknownInLive: string[]}}
+   */
+  reconcileDevices(live) {
+    const liveSet = live instanceof Set ? live : new Set(live);
+    const known = this._devices.snapshot();
+    const stale = [...known].filter((id) => !liveSet.has(id)).sort();
+    const unknownInLive = [...liveSet].filter((id) => !known.has(id)).sort();
+
+    const staleUnregistered = [];
+    for (const deviceId of stale) {
+      try {
+        this.unregisterDevice(deviceId);
+        staleUnregistered.push(deviceId);
+      } catch (err) {
+        // One failure must not stop the rest.
+        console.warn(`[${this.pluginId}] failed to unregister stale device ${deviceId}: ${err.message}`);
+      }
+    }
+    return { staleUnregistered, unknownInLive };
   }
 
   /**
@@ -885,6 +942,8 @@ module.exports = {
   // Streaming actions
   StreamContext,
   StreamTerminated,
+  // Device persistence
+  scopedSnapshotPath,
   // Versions reported in the heartbeat
   SDK_VERSION,
   PROTOCOL_VERSION,
