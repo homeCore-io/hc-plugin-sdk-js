@@ -35,6 +35,9 @@ const {
   Action, Capabilities, Concurrency, ItemOp, RequiresRole,
 } = require('./lib/capabilities');
 const { StreamContext, StreamTerminated } = require('./lib/streaming');
+const {
+  AlertSeverity, AlertActionTarget, AlertAction, PluginAlertKind, PluginAlert,
+} = require('./lib/alerts');
 const { DeviceTracker, scopedSnapshotPath } = require('./lib/persistence');
 
 /**
@@ -42,7 +45,7 @@ const { DeviceTracker, scopedSnapshotPath } = require('./lib/persistence');
  * operator which SDK to rebuild against; it is not what core checks
  * compatibility on.
  */
-const SDK_VERSION = '0.2.0';
+const SDK_VERSION = '0.3.0';
 
 /**
  * The wire protocol this SDK speaks, which is core's hc-types version. Core
@@ -101,6 +104,11 @@ class PluginBase {
     this._devices = new DeviceTracker();
     this._capabilities = null;
     this._activeStreams = new Map();
+
+    // The alerts last published, by topic, so a reconnect can say them again:
+    // core's broker forgets retained messages when it restarts, and an alert
+    // set an hour ago must not vanish because core did.
+    this._alerts = new Map();
   }
 
   // ---------------------------------------------------------------------------
@@ -325,6 +333,47 @@ class PluginBase {
     const topic   = `homecore/devices/${deviceId}/availability`;
     const payload = available ? 'online' : 'offline';
     this._publish(topic, payload, { retain: true, qos: 1 });
+  }
+
+  /**
+   * Say which of the plugin's alerts are true of a device now — the whole
+   * list; an empty one clears them. Each names a kind declared in
+   * `Capabilities`' `alertKinds`; homeCore decides whether it is shown and
+   * where it is sent.
+   *
+   * Retained, and said again on every reconnect, so set it when something
+   * changes, not on a timer.
+   *
+   * @param {string} deviceId
+   * @param {PluginAlert[]} alerts
+   */
+  setAlerts(deviceId, alerts) {
+    this._publishAlerts(`homecore/devices/${deviceId}/alerts`, alerts);
+  }
+
+  /**
+   * The same as {@link PluginBase#setAlerts} for the plugin's alerts about
+   * itself — a login that expired, a bridge that needs its button pressed.
+   *
+   * @param {PluginAlert[]} alerts
+   */
+  setPluginAlerts(alerts) {
+    this._publishAlerts(`homecore/plugins/${this.pluginId}/alerts`, alerts);
+  }
+
+  _publishAlerts(topic, alerts) {
+    const list = alerts || [];
+    const payload = JSON.stringify(list);
+    if (list.length > 0) this._alerts.set(topic, payload);
+    else this._alerts.delete(topic);
+    this._publish(topic, payload, { retain: true, qos: 1 });
+  }
+
+  /** Say the held alerts again: a restarted core's broker has forgotten them. */
+  _republishAlerts() {
+    for (const [topic, payload] of this._alerts) {
+      this._publish(topic, payload, { retain: true, qos: 1 });
+    }
   }
 
   /**
@@ -630,6 +679,7 @@ class PluginBase {
       for (const deviceId of this._devices) {
         this._client.subscribe(`homecore/devices/${deviceId}/cmd`, { qos: 1 });
       }
+      this._republishAlerts();
       if (this._managementEnabled) {
         this._client.subscribe(`homecore/plugins/${this.pluginId}/manage/cmd`, { qos: 1 });
         this._publishCapabilities();
@@ -933,6 +983,12 @@ module.exports = {
   PluginNotice,
   PluginNotices,
   NoticeLevel,
+  // Alerts
+  PluginAlert,
+  PluginAlertKind,
+  AlertAction,
+  AlertActionTarget,
+  AlertSeverity,
   // Capability actions
   Capabilities,
   Action,

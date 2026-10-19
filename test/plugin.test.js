@@ -905,3 +905,187 @@ describe('device persistence', () => {
     expect(fsMod.existsSync(scoped())).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Alerts — what a plugin says needs attention about its devices. The wire
+// shape is core's hc_types::alert::{PluginAlert, PluginAlertKind}; these pin it.
+// ---------------------------------------------------------------------------
+
+describe('alerts', () => {
+  const {
+    AlertAction, AlertActionTarget, AlertSeverity, PluginAlert, PluginAlertKind,
+    Capabilities: Caps,
+  } = require('../index');
+
+  let mockClient;
+
+  beforeEach(() => {
+    mockClient = {
+      on: jest.fn(), subscribe: jest.fn(), unsubscribe: jest.fn(), publish: jest.fn(),
+    };
+    mqtt.connect.mockReturnValue(mockClient);
+  });
+  afterEach(() => jest.clearAllMocks());
+
+  const started = () => {
+    const plugin = new TestPlugin();
+    plugin.run();
+    return plugin;
+  };
+  const alertPublishes = () => mockClient.publish.mock.calls
+    .filter(([t]) => t.endsWith('/alerts'))
+    .map(([t, p, o]) => [t, p, o]);
+
+  test('a bare alert carries only topic and reason', () => {
+    expect(JSON.parse(JSON.stringify(
+      new PluginAlert('firmware_update', 'Firmware 17.0.0 is out'),
+    ))).toEqual({ topic: 'firmware_update', reason: 'Firmware 17.0.0 is out' });
+  });
+
+  test('a full alert matches the Rust wire form', () => {
+    const alert = new PluginAlert('firmware_update', 'Firmware 17.0.0 is out', {
+      key: '17.0.0',
+      message: 'Kitchen strip: firmware 17.0.0 is out',
+      severity: AlertSeverity.INFO,
+      action: new AlertAction('Update…', 'install_firmware', {
+        params: { version: '17.0.0' }, confirm: true,
+      }),
+      since: new Date(Date.UTC(2026, 9, 19, 12, 0, 0)),
+    });
+    expect(alert.toJSON()).toEqual({
+      topic: 'firmware_update',
+      key: '17.0.0',
+      reason: 'Firmware 17.0.0 is out',
+      message: 'Kitchen strip: firmware 17.0.0 is out',
+      severity: 'info',
+      // target is omitted when it is the default, `device`.
+      action: {
+        label: 'Update…',
+        id: 'install_firmware',
+        params: { version: '17.0.0' },
+        confirm: true,
+      },
+      since: '2026-10-19T12:00:00.000Z',
+    });
+  });
+
+  test('an action omits target, params and confirm by default', () => {
+    expect(new AlertAction('Re-pair', 'pair').toJSON()).toEqual({ label: 'Re-pair', id: 'pair' });
+  });
+
+  test('a plugin target is spelled out', () => {
+    expect(new AlertAction('Sign in', 'login', { target: AlertActionTarget.PLUGIN }).toJSON())
+      .toEqual({ label: 'Sign in', id: 'login', target: 'plugin' });
+  });
+
+  test('an alert kind always carries severity and default_on', () => {
+    expect(new PluginAlertKind('bridge_button', 'Bridge needs its button pressed').toJSON())
+      .toEqual({
+        topic: 'bridge_button',
+        label: 'Bridge needs its button pressed',
+        severity: 'warning',
+        default_on: true,
+      });
+    expect(new PluginAlertKind('firmware_update', 'Firmware update available', {
+      description: 'A newer firmware is published.',
+      severity: AlertSeverity.INFO,
+      defaultOn: false,
+    }).toJSON()).toEqual({
+      topic: 'firmware_update',
+      label: 'Firmware update available',
+      description: 'A newer firmware is published.',
+      severity: 'info',
+      default_on: false,
+    });
+  });
+
+  test('alert kinds ride on the manifest', () => {
+    const plugin = started();
+    plugin.enableManagement({
+      intervalSecs: 3600,
+      capabilities: new Caps([], {
+        alertKinds: [new PluginAlertKind('firmware_update', 'Firmware update available')],
+      }),
+    });
+    const call = mockClient.publish.mock.calls.find(([t]) => t.endsWith('/capabilities'));
+    expect(call[2]).toEqual({ qos: 1, retain: true });
+    const manifest = JSON.parse(call[1]);
+    expect(manifest.actions).toEqual([]);
+    expect(manifest.alert_kinds).toEqual([{
+      topic: 'firmware_update',
+      label: 'Firmware update available',
+      severity: 'warning',
+      default_on: true,
+    }]);
+  });
+
+  test('a manifest without alert kinds does not mention them', () => {
+    expect(new Caps().toJSON()).not.toHaveProperty('alert_kinds');
+  });
+
+  test('setAlerts publishes the whole list retained', () => {
+    const plugin = started();
+    plugin.setAlerts('wled_1', [new PluginAlert('firmware_update', 'out', { key: '17.0.0' })]);
+    expect(alertPublishes()).toEqual([[
+      'homecore/devices/wled_1/alerts',
+      JSON.stringify([{ topic: 'firmware_update', key: '17.0.0', reason: 'out' }]),
+      { retain: true, qos: 1 },
+    ]]);
+  });
+
+  test('setPluginAlerts publishes to the plugin topic', () => {
+    const plugin = started();
+    plugin.setPluginAlerts([new PluginAlert('login_expired', 'The login expired')]);
+    const [[topic, payload, opts]] = alertPublishes();
+    expect(topic).toBe('homecore/plugins/plugin.test/alerts');
+    expect(JSON.parse(payload)).toEqual([{ topic: 'login_expired', reason: 'The login expired' }]);
+    expect(opts).toEqual({ retain: true, qos: 1 });
+  });
+
+  test('an empty list clears: it is published, and forgotten', () => {
+    const plugin = started();
+    plugin.setAlerts('wled_1', [new PluginAlert('firmware_update', 'out')]);
+    plugin.setAlerts('wled_1', []);
+    // The empty list goes out — it is what clears the retained message.
+    expect(alertPublishes().at(-1)).toEqual([
+      'homecore/devices/wled_1/alerts', '[]', { retain: true, qos: 1 },
+    ]);
+    expect(plugin._alerts.size).toBe(0);
+  });
+
+  test('the last list per topic is held', () => {
+    const plugin = started();
+    plugin.setAlerts('a', [new PluginAlert('k', 'first')]);
+    plugin.setAlerts('a', [new PluginAlert('k', 'second')]);
+    plugin.setAlerts('b', [new PluginAlert('k', 'other')]);
+    plugin.setPluginAlerts([new PluginAlert('p', 'mine')]);
+    const held = Object.fromEntries(
+      [...plugin._alerts].map(([t, p]) => [t, JSON.parse(p)[0].reason]),
+    );
+    expect(held).toEqual({
+      'homecore/devices/a/alerts': 'second',
+      'homecore/devices/b/alerts': 'other',
+      'homecore/plugins/plugin.test/alerts': 'mine',
+    });
+  });
+
+  test('held alerts are said again on every reconnect', () => {
+    // A restarted core's broker has forgotten its retained messages; an alert
+    // set an hour ago must not vanish because core did.
+    const plugin = started();
+    plugin.setAlerts('wled_1', [new PluginAlert('firmware_update', 'out')]);
+    plugin.setAlerts('gone', [new PluginAlert('x', 'y')]);
+    plugin.setAlerts('gone', []);
+    mockClient.publish.mockClear();
+
+    const connectHandler = mockClient.on.mock.calls.find(([e]) => e === 'connect')[1];
+    connectHandler(); // first connect
+    connectHandler(); // a reconnect
+    const once = [
+      'homecore/devices/wled_1/alerts',
+      JSON.stringify([{ topic: 'firmware_update', reason: 'out' }]),
+      { retain: true, qos: 1 },
+    ];
+    expect(alertPublishes()).toEqual([once, once]);
+  });
+});
