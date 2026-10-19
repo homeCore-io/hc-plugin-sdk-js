@@ -5,8 +5,8 @@
 Write a [homeCore](https://github.com/homeCore-io/homeCore) plugin in Node.js.
 
 Extend `PluginBase`, say what your devices are, handle commands. The SDK covers
-the MQTT connection, registration, the management protocol, notices, and
-capability actions.
+the MQTT connection, registration, the management protocol, notices, alerts,
+and capability actions.
 
 ## Installing
 
@@ -157,6 +157,57 @@ after a reconnect, after a config change. `notices.set([...])` replaces the whol
 set at once, which is the safest shape when a sync cycle recomputes everything.
 
 Levels are `PluginNotice.info`, `.warning`, and `.error`.
+
+## Alerts — what needs attention about a device
+
+Notices are about the plugin; **alerts** are about its devices, and live in
+the house's alert list (homeCore 0.1.85). Declare the kinds you can raise on
+the manifest, then say which are true of a device now — the whole list each
+time; an empty one clears them:
+
+```js
+const {
+  AlertAction, AlertSeverity, Capabilities, PluginAlert, PluginAlertKind,
+} = require('homecore-plugin-sdk');
+
+this.enableManagement({
+  capabilities: new Capabilities([], {
+    alertKinds: [
+      new PluginAlertKind('firmware_update', 'Firmware update available', {
+        severity: AlertSeverity.INFO,
+        defaultOn: false, // news, not a problem: off until someone turns it on
+      }),
+    ],
+  }),
+});
+
+this.setAlerts('wled_1', [
+  new PluginAlert('firmware_update', 'Firmware 17.0.0 is out', {
+    key: '17.0.0', // "skip this one" skips this version, not the kind
+    action: new AlertAction('Update…', 'install_firmware', { // a device action
+      params: { version: '17.0.0' },
+      confirm: true,
+    }),
+  }),
+]);
+
+// ...and once it is installed:
+this.setAlerts('wled_1', []);
+```
+
+**An alert is current state, not an event.** homeCore replaces what it held
+with each list, so one you stop sending has cleared. Set it when something
+changes, not on a timer.
+
+homeCore decides whether each is shown and where it is sent, never shows a
+plugin's alert as critical (a plugin asking for `critical` gets `error`), and
+lets automations start on, check and act on them. A kind's `defaultOn`
+defaults to `true`; set it `false` for news that isn't a problem, so it stays
+off until someone turns it on. `AlertAction` runs one of the device's actions
+by default; `{ target: AlertActionTarget.PLUGIN }` runs one of the plugin's
+own. `setPluginAlerts([...])` does the same for alerts about the plugin itself
+— a login that expired, a bridge that needs its button pressed. Alerts are
+retained and said again on every reconnect.
 
 ## Capability actions — buttons in the UI
 
@@ -314,6 +365,8 @@ the change, so the UI and the audit log can say so.
 | `publishPluginStatus(status)` | active / degraded / offline |
 | `publishEvent(type, payload)` | A structured event on the bus |
 | `notices` | `.raise()`, `.clear()`, `.set()`, `.snapshot()` |
+| `setAlerts(deviceId, alerts)` | The alerts true of a device now; `[]` clears |
+| `setPluginAlerts(alerts)` | The same, about the plugin itself |
 | `enableDevicePersistence(path)` | Remember registered devices across restarts |
 | `reconcileDevices(live)` | Unregister everything not in the live set |
 
@@ -380,7 +433,7 @@ zombies with `DELETE /api/v1/plugins/{id}/devices`.
 ## Parity with the Rust SDK
 
 Everything the Rust SDK does is here: registration, state, availability, the
-management protocol, log forwarding, notices, capability actions including
+management protocol, log forwarding, notices, alerts, capability actions including
 streaming, and cross-device state subscription.
 
 Everything the Rust SDK does is here. There is no gap left.
