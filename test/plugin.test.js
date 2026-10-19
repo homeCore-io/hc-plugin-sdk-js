@@ -1089,3 +1089,235 @@ describe('alerts', () => {
     expect(alertPublishes()).toEqual([once, once]);
   });
 });
+
+describe("the plugin's own screens", () => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const { ui } = require('../index');
+
+  // The build of the shared fixture below. Every homeCore SDK pins this same
+  // value — it is what plugin_sdk_rs::ui::load gives for these two files — so
+  // one UI folder has one address whichever SDK serves it.
+  const FIXTURE_BUILD = '6695a38681c3d6e7';
+  const FIXTURE_MANIFEST = '{"host_api":1,"slots":[{"slot":"plugin.page","element":"hc-x-page"}]}';
+
+  let mockClient;
+  let tmp;
+  const savedEnv = process.env.HC_PLUGIN_UI_DIR;
+  const savedArgv = process.argv;
+
+  beforeEach(() => {
+    mockClient = {
+      on: jest.fn(), subscribe: jest.fn(), unsubscribe: jest.fn(), publish: jest.fn(),
+    };
+    mqtt.connect.mockReturnValue(mockClient);
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hc-ui-test-'));
+    delete process.env.HC_PLUGIN_UI_DIR;
+  });
+  afterEach(() => {
+    jest.clearAllMocks();
+    jest.restoreAllMocks();
+    fs.rmSync(tmp, { recursive: true, force: true });
+    if (savedEnv === undefined) delete process.env.HC_PLUGIN_UI_DIR;
+    else process.env.HC_PLUGIN_UI_DIR = savedEnv;
+    process.argv = savedArgv;
+  });
+
+  const folder = () => {
+    fs.writeFileSync(path.join(tmp, 'manifest.json'), FIXTURE_MANIFEST);
+    fs.writeFileSync(path.join(tmp, 'index.js'), 'export {}');
+    return tmp;
+  };
+  const started = () => {
+    const plugin = new TestPlugin();
+    plugin.run();
+    return plugin;
+  };
+  const send = (body) => {
+    const handler = mockClient.on.mock.calls.find(([e]) => e === 'message')[1];
+    handler(
+      'homecore/plugins/plugin.test/manage/cmd',
+      Buffer.from(JSON.stringify({ request_id: 'r1', ...body })),
+    );
+  };
+  const responses = () => mockClient.publish.mock.calls
+    .filter(([t]) => t.endsWith('/manage/response'))
+    .map(([, p]) => JSON.parse(p));
+  const manifests = () => mockClient.publish.mock.calls
+    .filter(([t]) => t.endsWith('/capabilities'));
+
+  test('the build is the one every SDK computes', () => {
+    expect(ui.load(folder(), '1.2.3').build).toBe(FIXTURE_BUILD);
+  });
+
+  test('a UI folder is declared with a build that changes with its files', () => {
+    const d = folder();
+    const a = ui.load(d, '1.2.3');
+    expect([a.version, a.entry, a.hostApi]).toEqual(['1.2.3', 'index.js', 1]);
+    expect(a.build).toHaveLength(16);
+    fs.writeFileSync(path.join(d, 'index.js'), 'export const x = 1');
+    expect(ui.load(d, '1.2.3').build).not.toBe(a.build);
+  });
+
+  test('a folder without its entry or a manifest offers nothing', () => {
+    expect(() => ui.load(tmp, '1')).toThrow(ui.UiError);
+    fs.writeFileSync(path.join(tmp, 'manifest.json'), '{"host_api":1,"slots":[]}');
+    expect(() => ui.load(tmp, '1')).toThrow(/isn't there/);
+    fs.writeFileSync(path.join(tmp, 'index.js'), 'export {}');
+    expect(() => ui.load(tmp, '1')).toThrow(/nowhere/);
+  });
+
+  test('a UI keeps the slots the app knows and drops the rest', () => {
+    const v = new ui.PluginUi({
+      hostApi: 1,
+      version: '0.1.18',
+      slots: [
+        new ui.UiSlot('plugin.page', 'hc-ecowitt-page'),
+        new ui.UiSlot('device.panel', 'hc-ecowitt-station', ['weather_station']),
+        new ui.UiSlot('dashboard.card', 'hc-ecowitt-card'),
+        new ui.UiSlot('plugin.page', 'NoHyphen'),
+      ],
+    }).validated();
+    expect(v.slots).toHaveLength(2);
+    expect(v.slots[1].deviceTypes).toEqual(['weather_station']);
+    const page = [new ui.UiSlot('plugin.page', 'hc-x-page')];
+    const make = (entry, version = '1.0.0', slots = page) => new ui.PluginUi({
+      hostApi: 1, version, entry, slots,
+    }).validated();
+    expect(make('index.js')).not.toBeNull();
+    expect(make('../index.js')).toBeNull();
+    expect(make('/etc/index.js')).toBeNull();
+    expect(make('index.js', ' ')).toBeNull();
+    expect(make('index.js', '1.0.0', [])).toBeNull();
+  });
+
+  test('the manifest ui is the Rust wire form', () => {
+    const v = new ui.PluginUi({
+      hostApi: 1,
+      version: '1.0.0',
+      build: 'abc',
+      slots: [new ui.UiSlot('plugin.page', 'hc-x-page'), new ui.UiSlot('device.panel', 'hc-x-p', ['light'])],
+    });
+    expect(JSON.parse(JSON.stringify(v))).toEqual({
+      host_api: 1,
+      version: '1.0.0',
+      build: 'abc',
+      entry: 'index.js',
+      slots: [
+        { slot: 'plugin.page', element: 'hc-x-page' },
+        { slot: 'device.panel', element: 'hc-x-p', device_types: ['light'] },
+      ],
+    });
+  });
+
+  test('relative paths stay inside the folder', () => {
+    for (const ok of ['index.js', 'a/b.js', './x.js']) expect(ui.relativePath(ok)).toBe(true);
+    for (const bad of ['', '/etc/passwd', '../x', 'a/../../x', 'a//b', 'a\\b', 'a/']) {
+      expect(ui.relativePath(bad)).toBe(false);
+    }
+  });
+
+  test('files go in pieces and never from outside the folder', () => {
+    fs.writeFileSync(path.join(tmp, 'index.js'), 'abcdefghij');
+    const p = (f, o, m) => {
+      const r = ui.piece(tmp, f, o, m);
+      return [r.data.toString(), r.done];
+    };
+    expect(p('index.js', 0, 4)).toEqual(['abcd', false]);
+    expect(p('index.js', 8, 4)).toEqual(['ij', true]);
+    expect(p('index.js', 6, 4)).toEqual(['ghij', true]);
+    expect(p('index.js', 50, 4)).toEqual(['', true]);
+    for (const bad of ['../etc/passwd', 'missing.js', '/etc/passwd']) {
+      expect(() => ui.piece(tmp, bad, 0, 4)).toThrow(/^no such file$/);
+    }
+  });
+
+  test('findDir prefers the env, then the package, then the source tree', () => {
+    process.argv = [savedArgv[0], path.join(tmp, 'elsewhere', 'run.js')];
+    const project = path.join(tmp, 'proj');
+    const pkg = path.join(project, 'lib');
+    fs.mkdirSync(pkg, { recursive: true });
+    fs.writeFileSync(path.join(project, 'package.json'), '{}');
+    expect(ui.findDir(pkg)).toBeNull();
+    // A folder without a manifest doesn't count.
+    fs.mkdirSync(path.join(project, 'ui', 'dist'), { recursive: true });
+    expect(ui.findDir(pkg)).toBeNull();
+    fs.writeFileSync(path.join(project, 'ui', 'dist', 'manifest.json'), '{}');
+    expect(ui.findDir(pkg)).toBe(path.join(project, 'ui', 'dist'));
+    fs.mkdirSync(path.join(pkg, 'ui'));
+    fs.writeFileSync(path.join(pkg, 'ui', 'manifest.json'), '{}');
+    expect(ui.findDir(pkg)).toBe(path.join(pkg, 'ui'));
+    expect(ui.findDir(path.join(pkg, 'main.js'))).toBe(path.join(pkg, 'ui'));
+    process.env.HC_PLUGIN_UI_DIR = '/somewhere';
+    expect(ui.findDir(pkg)).toBe('/somewhere');
+  });
+
+  test('withUiDir puts ui on the manifest even with no actions', () => {
+    jest.spyOn(console, 'info').mockImplementation(() => {});
+    const plugin = started();
+    expect(plugin.withUiDir(folder(), '2.0.0')).toBe(plugin);
+    plugin.enableManagement({ intervalSecs: 3600 });
+    const calls = manifests();
+    expect(calls).toHaveLength(1);
+    expect(calls[0][2]).toEqual({ qos: 1, retain: true });
+    const m = JSON.parse(calls[0][1]);
+    expect(m.plugin_id).toBe('plugin.test');
+    expect(m.actions).toEqual([]);
+    expect(m.ui).toEqual({
+      host_api: 1,
+      version: '2.0.0',
+      build: FIXTURE_BUILD,
+      entry: 'index.js',
+      slots: [{ slot: 'plugin.page', element: 'hc-x-page' }],
+    });
+  });
+
+  test('withUiDir on a missing folder warns and offers no UI', () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const plugin = started();
+    plugin.withUiDir(path.join(tmp, 'nope'), '1.0.0');
+    expect(warn.mock.calls[0][0]).toMatch(/No plugin UI offered/);
+    plugin.enableManagement({ intervalSecs: 3600 });
+    expect(manifests()).toHaveLength(0);
+    send({ action: 'ui_file', file: 'index.js' });
+    expect(responses()).toEqual([
+      { request_id: 'r1', status: 'error', error: 'no such file: this plugin serves no UI' },
+    ]);
+  });
+
+  test('ui_file serves pieces in base64', () => {
+    jest.spyOn(console, 'info').mockImplementation(() => {});
+    const plugin = started();
+    const d = folder();
+    const big = Buffer.alloc(256 * 1024);
+    for (let i = 0; i < big.length; i += 1) big[i] = i % 256;
+    fs.writeFileSync(path.join(d, 'big.js'), big);
+    plugin.withUiDir(d, '1.0.0');
+    plugin.enableManagement({ intervalSecs: 3600 });
+
+    send({ request_id: 'a', action: 'ui_file', file: 'index.js' });
+    send({ request_id: 'b', action: 'ui_file', file: 'index.js', offset: 8, max: 1 });
+    send({ request_id: 'c', action: 'ui_file', file: 'big.js' });
+    send({ request_id: 'd', action: 'ui_file', file: 'big.js', max: 1e9 });
+    send({ request_id: 'e', action: 'ui_file', file: 'big.js', max: 0 });
+    send({ request_id: 'f', action: 'ui_file', file: '../manifest.json' });
+    send({ request_id: 'g', action: 'ui_file', file: 'nope.js' });
+    const r = Object.fromEntries(responses().map((x) => [x.request_id, x]));
+    const bytes = (x) => Buffer.from(x.data, 'base64');
+
+    expect(r.a).toEqual({
+      request_id: 'a', status: 'ok', data: Buffer.from('export {}').toString('base64'), done: true,
+    });
+    expect(bytes(r.b).toString()).toBe('}');
+    expect(r.b.done).toBe(true);
+    // max defaults to 128 KiB, and is clamped to [1, 160 KiB].
+    expect(bytes(r.c)).toHaveLength(131072);
+    expect(r.c.done).toBe(false);
+    expect(bytes(r.d)).toHaveLength(163840);
+    expect(r.d.done).toBe(false);
+    expect(bytes(r.e)).toHaveLength(1);
+    expect(r.f).toEqual({ request_id: 'f', status: 'error', error: 'no such file' });
+    expect(r.g).toEqual({ request_id: 'g', status: 'error', error: 'no such file' });
+  });
+});

@@ -39,13 +39,14 @@ const {
   AlertSeverity, AlertActionTarget, AlertAction, PluginAlertKind, PluginAlert,
 } = require('./lib/alerts');
 const { DeviceTracker, scopedSnapshotPath } = require('./lib/persistence');
+const ui = require('./lib/ui');
 
 /**
  * This SDK's version, reported in every heartbeat. Informational — it tells an
  * operator which SDK to rebuild against; it is not what core checks
  * compatibility on.
  */
-const SDK_VERSION = '0.3.0';
+const SDK_VERSION = '0.4.0';
 
 /**
  * The wire protocol this SDK speaks, which is core's hc-types version. Core
@@ -104,6 +105,11 @@ class PluginBase {
     this._devices = new DeviceTracker();
     this._capabilities = null;
     this._activeStreams = new Map();
+
+    // The plugin's own screens, when it carries them: what the manifest
+    // declares, and the folder the files are served from.
+    this._ui = null;
+    this._uiDir = null;
 
     // The alerts last published, by topic, so a reconnect can say them again:
     // core's broker forgets retained messages when it restarts, and an alert
@@ -487,13 +493,73 @@ class PluginBase {
    * otherwise a late-joining core never learns the plugin has actions.
    */
   _publishCapabilities() {
-    if (!this._capabilities) return;
-    this._capabilities.pluginId = this.pluginId;
+    // A plugin with screens but no actions still needs the manifest: the `ui`
+    // rides on it.
+    if (!this._capabilities && !this._ui) return;
+    const caps = this._capabilities || new Capabilities();
+    caps.pluginId = this.pluginId;
+    const manifest = caps.toJSON();
+    if (this._ui) manifest.ui = this._ui.toJSON();
     this._publish(
       `homecore/plugins/${this.pluginId}/capabilities`,
-      JSON.stringify(this._capabilities.toJSON()),
+      JSON.stringify(manifest),
       { qos: 1, retain: true },
     );
+  }
+
+  /**
+   * Carry and serve the plugin's own screens: the built UI folder `dir` (its
+   * `manifest.json` says where each component goes).
+   *
+   * They are declared on the manifest under `version` — the plugin's — with a
+   * hash of the files as their `build`, and served from `dir` when homeCore
+   * asks; homeCore passes them through to the app and keeps none.
+   *
+   * A folder that isn't there, or offers nothing, is said in the log and
+   * skipped — the app then shows its generic screens. Returns the plugin, so
+   * it chains:
+   *
+   *     const dir = ui.findDir(__dirname);
+   *     if (dir) this.withUiDir(dir, require('./package.json').version);
+   *
+   * @param {string} dir
+   * @param {string} version - The plugin's version.
+   * @returns {this}
+   */
+  withUiDir(dir, version) {
+    let loaded;
+    try {
+      loaded = ui.load(dir, String(version));
+    } catch (err) {
+      console.warn(`[${this.pluginId}] No plugin UI offered (${dir}): ${err.message}`);
+      return this;
+    }
+    console.info(`[${this.pluginId}] Serving the plugin's own UI from ${dir} (build ${loaded.build})`);
+    this._ui = loaded;
+    this._uiDir = dir;
+    if (this._managementEnabled) this._publishCapabilities();
+    return this;
+  }
+
+  /** A piece of one of the UI's files, for homeCore to pass on. */
+  _handleUiFile(cmd, requestId) {
+    if (!this._uiDir) {
+      this._respond(requestId, { error: 'no such file: this plugin serves no UI' });
+      return;
+    }
+    // As serde_json's as_u64 reads them for the Rust SDK.
+    const u64 = (v, d) => (Number.isInteger(v) && v >= 0 ? v : d);
+    const file = typeof cmd.file === 'string' ? cmd.file : '';
+    const offset = u64(cmd.offset, 0);
+    const max = Math.min(Math.max(u64(cmd.max, 128 * 1024), 1), 160 * 1024);
+    let got;
+    try {
+      got = ui.piece(this._uiDir, file, offset, max);
+    } catch (err) {
+      this._respond(requestId, { error: err.message });
+      return;
+    }
+    this._respond(requestId, { extra: { data: got.data.toString('base64'), done: got.done } });
   }
 
   /**
@@ -763,6 +829,10 @@ class PluginBase {
         this._respond(requestId);
         break;
 
+      case 'ui_file':
+        this._handleUiFile(cmd, requestId);
+        break;
+
       case 'get_config':
         if (this._configPath) {
           try {
@@ -998,6 +1068,11 @@ module.exports = {
   // Streaming actions
   StreamContext,
   StreamTerminated,
+  // The plugin's own screens
+  ui,
+  PluginUi: ui.PluginUi,
+  UiSlot: ui.UiSlot,
+  UiError: ui.UiError,
   // Device persistence
   scopedSnapshotPath,
   // Versions reported in the heartbeat
