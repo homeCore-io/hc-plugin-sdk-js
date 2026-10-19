@@ -1168,28 +1168,38 @@ describe("the plugin's own screens", () => {
     expect(() => ui.load(tmp, '1')).toThrow(/nowhere/);
   });
 
-  test('a UI keeps the slots the app knows and drops the rest', () => {
-    const v = new ui.PluginUi({
-      hostApi: 1,
-      version: '0.1.18',
-      slots: [
-        new ui.UiSlot('plugin.page', 'hc-ecowitt-page'),
-        new ui.UiSlot('device.panel', 'hc-ecowitt-station', ['weather_station']),
-        new ui.UiSlot('dashboard.card', 'hc-ecowitt-card'),
-        new ui.UiSlot('plugin.page', 'NoHyphen'),
-      ],
-    }).validated();
-    expect(v.slots).toHaveLength(2);
-    expect(v.slots[1].deviceTypes).toEqual(['weather_station']);
-    const page = [new ui.UiSlot('plugin.page', 'hc-x-page')];
-    const make = (entry, version = '1.0.0', slots = page) => new ui.PluginUi({
-      hostApi: 1, version, entry, slots,
-    }).validated();
-    expect(make('index.js')).not.toBeNull();
-    expect(make('../index.js')).toBeNull();
-    expect(make('/etc/index.js')).toBeNull();
-    expect(make('index.js', ' ')).toBeNull();
-    expect(make('index.js', '1.0.0', [])).toBeNull();
+  // Which slots exist is homeCore's to say: an SDK that dropped the ones it
+  // doesn't know would keep a plugin from ever offering a newer one.
+  test('every slot is passed on as declared, unknown ones and fields included', () => {
+    const later = { slot: 'future.slot', element: 'hc-x-later' };
+    const card = {
+      slot: 'dashboard.card',
+      element: 'hc-x-card',
+      label: 'Quick presets',
+      description: 'One tap to a preset',
+      forms: ['compact', 'large'],
+      settings: 'hc-x-card-settings',
+      someday: { nested: true },
+    };
+    const panel = { slot: 'device.panel', element: 'hc-x-panel', device_types: ['light'] };
+    const odd = { slot: 'plugin.page', element: 'NoHyphen' };
+    fs.writeFileSync(path.join(tmp, 'manifest.json'),
+      JSON.stringify({ host_api: 1, slots: [later, card, panel, odd] }));
+    fs.writeFileSync(path.join(tmp, 'index.js'), 'export {}');
+    const got = JSON.parse(JSON.stringify(ui.load(tmp, '1.0.0'))).slots;
+    expect(got).toEqual([later, card, panel, odd]);
+  });
+
+  test('an unusable version or entry offers nothing', () => {
+    const d = folder();
+    expect(() => ui.load(d, ' ')).toThrow(/version or entry/);
+    fs.writeFileSync(path.join(d, 'manifest.json'),
+      '{"host_api":1,"entry":"./index.js","slots":[{"slot":"plugin.page","element":"hc-x-page"}]}');
+    expect(ui.load(d, '1').entry).toBe('./index.js');
+    fs.mkdirSync(path.join(d, 'sub'));
+    fs.writeFileSync(path.join(d, 'sub', 'manifest.json'),
+      '{"host_api":1,"entry":"../index.js","slots":[{"slot":"plugin.page","element":"hc-x-page"}]}');
+    expect(() => ui.load(path.join(d, 'sub'), '1')).toThrow(/version or entry/);
   });
 
   test('the manifest ui is the Rust wire form', () => {
