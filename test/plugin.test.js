@@ -112,10 +112,10 @@ describe('PluginBase', () => {
   test('publishState sends retained QoS 1 message', () => {
     const plugin = new TestPlugin();
     plugin.run();
-    plugin.publishState('light.01', { on: true, brightness: 200 });
+    plugin.publishState('light.01', { on: true, brightness_pct: 80 });
     expect(mockClient.publish).toHaveBeenCalledWith(
       'homecore/devices/light.01/state',
-      JSON.stringify({ on: true, brightness: 200 }),
+      JSON.stringify({ on: true, brightness_pct: 80 }),
       { retain: true, qos: 1 },
       expect.any(Function),
     );
@@ -141,10 +141,10 @@ describe('PluginBase', () => {
   test('publishStatePartial sends non-retained QoS 1 message', () => {
     const plugin = new TestPlugin();
     plugin.run();
-    plugin.publishStatePartial('light.01', { brightness: 100 });
+    plugin.publishStatePartial('light.01', { brightness_pct: 40 });
     expect(mockClient.publish).toHaveBeenCalledWith(
       'homecore/devices/light.01/state/partial',
-      JSON.stringify({ brightness: 100 }),
+      JSON.stringify({ brightness_pct: 40 }),
       { retain: false, qos: 1 },
       expect.any(Function),
     );
