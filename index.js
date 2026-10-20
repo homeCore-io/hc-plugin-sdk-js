@@ -19,7 +19,7 @@
  *   onConnect() {
  *     this.registerDevice('light.01', 'My Light', {
  *       on: { type: 'boolean' },
- *       brightness: { type: 'integer', minimum: 0, maximum: 255 },
+ *       brightness_pct: { type: 'number', minimum: 0, maximum: 100 },
  *     });
  *   }
  * }
@@ -46,7 +46,7 @@ const ui = require('./lib/ui');
  * operator which SDK to rebuild against; it is not what core checks
  * compatibility on.
  */
-const SDK_VERSION = '0.4.1';
+const SDK_VERSION = '0.4.2';
 
 /**
  * The wire protocol this SDK speaks, which is core's hc-types version. Core

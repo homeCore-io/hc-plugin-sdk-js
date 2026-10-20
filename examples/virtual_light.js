@@ -8,6 +8,11 @@
  * publishes its initial state, then toggles on/off and steps brightness every
  * 5 seconds.  It also responds to commands received via MQTT.
  *
+ * It speaks homeCore's device vocabulary: `on` and `brightness_pct` (0–100,
+ * 0 meaning off), and the one declared action `{"action": "toggle"}`.
+ * `{"on": true}` restores the last level. A real light converts its own scale
+ * (0–255, 0–254, 0–99, …) to `brightness_pct` inside the plugin.
+ *
  * Usage:
  *   npm install
  *   node examples/virtual_light.js
@@ -19,41 +24,72 @@ const { PluginBase } = require('../index');
 
 const DEVICE_ID = 'light.virtual_js_01';
 const CAPABILITIES = {
-  on:         { type: 'boolean' },
-  brightness: { type: 'integer', minimum: 0, maximum: 255 },
+  on:             { type: 'boolean' },
+  brightness_pct: { type: 'number', minimum: 0, maximum: 100 },
 };
 
 class VirtualLightPlugin extends PluginBase {
   constructor(options = {}) {
     super({ pluginId: options.id || 'plugin.virtual_js', ...options });
-    this._state = { on: false, brightness: 128 };
+    this._on = false;
+    // The last level, kept while off so {"on": true} restores it.
+    this._levelPct = 50;
+  }
+
+  /** What homeCore sees. On never reports 0 %; off reports 0 %. */
+  _state() {
+    return { on: this._on, brightness_pct: this._on ? this._levelPct : 0 };
+  }
+
+  /**
+   * Apply one of the two command shapes homeCore sends: an attribute write
+   * (`{"on": true}`, `{"brightness_pct": 40}`) or a declared action
+   * (`{"action": "toggle"}`).
+   */
+  _apply(payload) {
+    if (payload.action !== undefined) {
+      if (payload.action === 'toggle') this._on = !this._on;
+      else throw new Error(`unknown action: ${payload.action}`);
+      return;
+    }
+    if ('on' in payload) this._on = !!payload.on;
+    if ('brightness_pct' in payload) {
+      const pct = Math.max(0, Math.min(100, Number(payload.brightness_pct)));
+      if (pct === 0) {
+        this._on = false; // 0 % is off; the level is kept for the next on
+      } else {
+        this._levelPct = pct;
+        this._on = true;
+      }
+    }
   }
 
   onConnect() {
     this.registerDevice(DEVICE_ID, 'Virtual Light (Node.js)', CAPABILITIES, 'living_room');
     this.publishAvailability(DEVICE_ID, true);
-    this.publishState(DEVICE_ID, { ...this._state });
+    this.publishState(DEVICE_ID, this._state());
     this.publishPluginStatus('active');
 
-    console.log(`[${this.pluginId}] Device registered — initial state:`, this._state);
+    console.log(`[${this.pluginId}] Device registered — initial state:`, this._state());
 
     // Periodic toggle every 5 seconds.
     setInterval(() => {
-      this._state.on         = !this._state.on;
-      this._state.brightness = (this._state.brightness + 16) % 256;
-      console.log(`[${this.pluginId}] Periodic tick — state:`, this._state);
-      this.publishState(DEVICE_ID, { ...this._state });
+      this._on       = !this._on;
+      this._levelPct = (this._levelPct % 100) + 10;
+      console.log(`[${this.pluginId}] Periodic tick — state:`, this._state());
+      this.publishState(DEVICE_ID, this._state());
     }, 5000);
   }
 
   onCommand(deviceId, payload) {
     console.log(`[${this.pluginId}] Command for ${deviceId}:`, payload);
-    // Merge only known attributes to prevent arbitrary state pollution.
-    for (const key of Object.keys(CAPABILITIES)) {
-      if (key in payload) this._state[key] = payload[key];
+    try {
+      this._apply(payload);
+    } catch (e) {
+      console.warn(`[${this.pluginId}] ${e.message}`);
     }
-    this.publishStateForCommand(deviceId, { ...this._state }, payload, 'virtual_light');
-    console.log(`[${this.pluginId}] State after command:`, this._state);
+    this.publishStateForCommand(deviceId, this._state(), payload, 'virtual_light');
+    console.log(`[${this.pluginId}] State after command:`, this._state());
   }
 }
 
