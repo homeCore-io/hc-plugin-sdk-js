@@ -47,7 +47,7 @@ const supervised = require('./lib/supervised');
  * operator which SDK to rebuild against; it is not what core checks
  * compatibility on.
  */
-const SDK_VERSION = '0.4.2';
+const SDK_VERSION = '0.4.3';
 
 /**
  * The wire protocol this SDK speaks, which is core's hc-types version. Core
