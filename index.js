@@ -40,6 +40,7 @@ const {
 } = require('./lib/alerts');
 const { DeviceTracker, scopedSnapshotPath } = require('./lib/persistence');
 const ui = require('./lib/ui');
+const supervised = require('./lib/supervised');
 
 /**
  * This SDK's version, reported in every heartbeat. Informational — it tells an
@@ -728,6 +729,7 @@ class PluginBase {
    * @returns {import('mqtt').MqttClient}
    */
   run() {
+    supervised.watch(this.pluginId);
     const url = `mqtt://${this.brokerHost}:${this.brokerPort}`;
     const opts = {
       clientId: this.pluginId,
@@ -1075,6 +1077,8 @@ module.exports = {
   UiError: ui.UiError,
   // Device persistence
   scopedSnapshotPath,
+  // Stopping with the homeCore that started it
+  SUPERVISED_ENV: supervised.SUPERVISED_ENV,
   // Versions reported in the heartbeat
   SDK_VERSION,
   PROTOCOL_VERSION,
