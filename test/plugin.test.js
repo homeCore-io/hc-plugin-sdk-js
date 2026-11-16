@@ -1331,3 +1331,79 @@ describe("the plugin's own screens", () => {
     expect(r.g).toEqual({ request_id: 'g', status: 'error', error: 'no such file' });
   });
 });
+
+describe('stop', () => {
+  let mockClient;
+
+  beforeEach(() => {
+    mockClient = {
+      on:          jest.fn(),
+      subscribe:   jest.fn(),
+      unsubscribe: jest.fn(),
+      publish:     jest.fn(),
+      end:         jest.fn((_force, _opts, cb) => cb && cb()),
+    };
+    mqtt.connect.mockReturnValue(mockClient);
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  class Stopper extends PluginBase {
+    constructor() {
+      super({ pluginId: 'plugin.test' });
+      this.order = [];
+    }
+    onCommand() {}
+  }
+
+  test('runs onStop, marks every device offline, then the plugin, then disconnects', async () => {
+    const plugin = new Stopper();
+    plugin.run();
+    plugin.registerDevice('light.b', 'B');
+    plugin.registerDevice('light.a', 'A');
+    mockClient.publish.mockClear();
+    plugin.onStop = async () => {
+      // What a plugin leaves safe goes out before the goodbye.
+      plugin.publishState('heat.a', { on: false });
+    };
+
+    await plugin.stop();
+
+    const said = mockClient.publish.mock.calls.map(([t, p, o]) => `${t} ${p} retain=${!!o.retain}`);
+    expect(said).toEqual([
+      'homecore/devices/heat.a/state {"on":false} retain=true',
+      'homecore/devices/light.a/availability offline retain=true',
+      'homecore/devices/light.b/availability offline retain=true',
+      'homecore/plugins/plugin.test/status offline retain=true',
+    ]);
+    expect(mockClient.end).toHaveBeenCalledTimes(1);
+    expect(mockClient.end.mock.calls[0][0]).toBe(false);
+
+    // A second SIGTERM, or stop() after Ctrl-C, says nothing again.
+    await plugin.stop();
+    expect(mockClient.end).toHaveBeenCalledTimes(1);
+  });
+
+  test('an onStop that throws or hangs still marks devices offline', async () => {
+    const throws = new Stopper();
+    throws.run();
+    throws.registerDevice('light.a', 'A');
+    throws.onStop = () => { throw new Error('hook failed'); };
+    await throws.stop();
+    expect(mockClient.publish).toHaveBeenCalledWith(
+      'homecore/devices/light.a/availability', 'offline', expect.anything(), expect.anything());
+
+    mockClient.publish.mockClear();
+    const hangs = new Stopper();
+    hangs.run();
+    hangs.registerDevice('light.a', 'A');
+    hangs.onStop = () => new Promise(() => {});
+    const t0 = Date.now();
+    await hangs.stop();
+    expect(Date.now() - t0).toBeLessThan(1500);
+    expect(mockClient.publish).toHaveBeenCalledWith(
+      'homecore/plugins/plugin.test/status', 'offline', expect.anything(), expect.anything());
+  });
+});
