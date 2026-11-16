@@ -41,6 +41,7 @@ const {
 const { DeviceTracker, scopedSnapshotPath } = require('./lib/persistence');
 const ui = require('./lib/ui');
 const supervised = require('./lib/supervised');
+const stopping = require('./lib/stopping');
 
 /**
  * This SDK's version, reported in every heartbeat. Informational — it tells an
@@ -116,6 +117,9 @@ class PluginBase {
     // core's broker forgets retained messages when it restarts, and an alert
     // set an hour ago must not vanish because core did.
     this._alerts = new Map();
+
+    /** @type {Promise<void>|null} set once stop() has begun */
+    this._stopping = null;
   }
 
   // ---------------------------------------------------------------------------
@@ -683,6 +687,64 @@ class PluginBase {
   onSetConfig(config) { return false; }
 
   /**
+   * Called once when the plugin is stopping, before it says goodbye.
+   *
+   * Leave what you control safe here (turn off a heater you were running,
+   * close a session). May return a promise; it gets 1 second, since homeCore
+   * kills a plugin 2 seconds after asking it to stop. Your devices are marked
+   * offline after it settles.
+   *
+   * @returns {void|Promise<void>}
+   */
+  onStop() {}
+
+  /**
+   * Stop: run {@link PluginBase#onStop}, mark every registered device offline,
+   * report the plugin offline, and disconnect once those are sent.
+   *
+   * Called on SIGTERM (how homeCore and a plugin runtime stop a plugin) and on
+   * Ctrl-C, which then exit the process, so a stopped plugin's devices read
+   * offline at once rather than showing their last state as if nothing had
+   * happened. Called directly, it leaves the process running. Safe to call
+   * more than once: every call returns the same promise.
+   *
+   * @returns {Promise<void>}
+   */
+  stop() {
+    if (!this._stopping) this._stopping = this._stop();
+    return this._stopping;
+  }
+
+  async _stop() {
+    let hook;
+    try {
+      hook = Promise.resolve(this.onStop());
+    } catch (err) {
+      hook = Promise.reject(err);
+    }
+    hook = hook.catch((err) => {
+      console.error(`[${this.pluginId}] onStop failed; stopping anyway:`, err && err.message);
+    });
+    if (!(await stopping.within(hook, stopping.HOOK_LIMIT_MS))) {
+      console.warn(`[${this.pluginId}] onStop took over a second; stopping anyway`);
+    }
+    if (this._heartbeatTimer) {
+      clearInterval(this._heartbeatTimer);
+      this._heartbeatTimer = null;
+    }
+    const ids = [...this._devices].sort();
+    for (const deviceId of ids) this.publishAvailability(deviceId, false);
+    this.publishPluginStatus('offline');
+    console.log(`[${this.pluginId}] Stopping; ${ids.length} device(s) offline`);
+    stopping.forget(this);
+    const client = this._client;
+    if (client) {
+      // Not forced: what was queued above goes out before the DISCONNECT.
+      await new Promise((resolve) => client.end(false, {}, () => resolve()));
+    }
+  }
+
+  /**
    * Extract a HomeCore change record from an inbound command payload.
    *
    * @param {object} commandPayload - Decoded JSON command payload.
@@ -730,6 +792,7 @@ class PluginBase {
    */
   run() {
     supervised.watch(this.pluginId);
+    stopping.watch(this);
     const url = `mqtt://${this.brokerHost}:${this.brokerPort}`;
     const opts = {
       clientId: this.pluginId,

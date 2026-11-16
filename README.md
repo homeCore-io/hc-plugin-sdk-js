@@ -421,6 +421,7 @@ the change, so the UI and the audit log can say so.
 | `setPluginAlerts(alerts)` | The same, about the plugin itself |
 | `enableDevicePersistence(path)` | Remember registered devices across restarts |
 | `reconcileDevices(live)` | Unregister everything not in the live set |
+| `stop()` | `onStop()`, every device offline, the plugin offline, disconnect |
 
 ### Hooks to override
 
@@ -431,6 +432,13 @@ the change, so the UI and the audit log can say so.
 | `onAction(action, params, ctx)` | A capability action; `ctx` only when streaming |
 | `onState(deviceId, state)` | A device you subscribed to changed |
 | `onSetConfig(config)` | A structured config write |
+| `onStop()` | Stopping. Leave what you control safe; 1 second, may return a promise |
+
+**Stopping.** homeCore and a plugin runtime stop a plugin with SIGTERM, and
+kill it 2 seconds later. Once `run()` is called, SIGTERM and Ctrl-C call
+`stop()`: your `onStop()`, then every registered device offline, the plugin
+offline, and a disconnect once those are sent. Then the process exits. Don't
+add a SIGTERM handler of your own; put what has to happen in `onStop()`.
 
 ## Secrets in logs
 
