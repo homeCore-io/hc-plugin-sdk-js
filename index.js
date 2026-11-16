@@ -48,7 +48,7 @@ const stopping = require('./lib/stopping');
  * operator which SDK to rebuild against; it is not what core checks
  * compatibility on.
  */
-const SDK_VERSION = '0.4.3';
+const SDK_VERSION = '0.4.4';
 
 /**
  * The wire protocol this SDK speaks, which is core's hc-types version. Core
