@@ -10,9 +10,13 @@
  *
  * Run it against a homeCore:
  *
- *   npm install homecore-plugin-sdk
+ *   npm install github:homeCore-io/hc-plugin-sdk-js#v0.4.6
  *   node discovery_plugin.js
- *   HC_BROKER_HOST=10.0.0.5 node discovery_plugin.js
+ *   HC_BROKER_HOST=192.168.1.5 node discovery_plugin.js
+ *
+ * Nothing is on npm yet, so the SDK installs from its GitHub tag. This file
+ * requires '../index' to run from the SDK checkout; in your own plugin,
+ * require('homecore-plugin-sdk').
  *
  * Then, in the web UI, open Plugins → Discovery Demo and you will see:
  *
@@ -29,8 +33,8 @@ const {
 } = require('../index');
 
 // Stand-ins for a real network sweep.
-const CANDIDATE_HOSTS = Array.from({ length: 6 }, (_, i) => `10.0.0.${10 + i}`);
-const HUBS_THAT_ANSWER = { '10.0.0.12': 'HUB-A1B2' };
+const CANDIDATE_HOSTS = Array.from({ length: 6 }, (_, i) => `192.168.1.${10 + i}`);
+const HUBS_THAT_ANSWER = { '192.168.1.12': 'HUB-A1B2' };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -91,11 +95,13 @@ class DiscoveryPlugin extends PluginBase {
     if (action === 'discover_hubs') return this._discover(ctx);
     if (action === 'ping_hub') return { reachable: this.hubHost in HUBS_THAT_ANSWER };
     if (action === 'forget_hub') {
-      if (!this.hubHost) return { status: 'nothing to forget' };
+      // The result is merged into the response, whose "status" says whether
+      // the action succeeded, so the result can't use that key.
+      if (!this.hubHost) return { outcome: 'nothing to forget' };
       this.unregisterDevice(`hub_${HUBS_THAT_ANSWER[this.hubHost]}`);
       this.hubHost = null;
       this._refreshNotices();
-      return { status: 'forgotten' };
+      return { outcome: 'forgotten' };
     }
     return null; // not ours — the SDK answers "unknown action"
   }

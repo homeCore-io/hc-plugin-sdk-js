@@ -30,45 +30,82 @@ links the directory rather than copying it, so SDK edits are live immediately.
 
 ### From a release
 
-```bash
-npm install github:homeCore-io/hc-plugin-sdk-js#v0.2.0
-```
+Nothing is published to npm yet. Install from the GitHub tag, which pins you
+to a known release the same way the Rust SDK's git dependency does:
 
-**Nothing is published to npm**, so there is no `npm install
-homecore-plugin-sdk`. Installing from the tag pins you to a known release the
-same way the Rust SDK's git dependency does.
+```bash
+npm install github:homeCore-io/hc-plugin-sdk-js#v0.4.6
+```
 
 ## Your first plugin
 
+homeCore starts a plugin with one argument, the path of its config file, and
+writes a `[homecore]` table into that file with everything needed to log in to
+its broker:
+
+```toml
+[homecore]
+broker_host = "127.0.0.1"
+broker_port = 1883
+plugin_id   = "plugin.mylight"
+password    = "..."
+```
+
+This SDK has no config loader, so the plugin reads the file itself. Any TOML
+parser works; this uses [smol-toml](https://www.npmjs.com/package/smol-toml)
+(`npm install smol-toml`):
+
 ```javascript
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('fs');
+const { parse } = require('smol-toml');
 const { PluginBase } = require('homecore-plugin-sdk');
 
-class MyLight extends PluginBase {
-  constructor() {
-    super({ pluginId: 'plugin.mylight' });
-  }
+// homeCore starts a plugin as `<binary> <config path>`.
+const configPath = process.argv[2];
+if (!configPath) {
+  console.error('usage: mylight <config.toml>');
+  process.exit(2);
+}
+const config = parse(fs.readFileSync(configPath, 'utf8'));
+const hc = config.homecore || {};
 
+class MyLight extends PluginBase {
   onConnect() {
-    // Register here, not in the constructor — this runs again after a reconnect.
+    // Register here, not in the constructor: this runs again after a reconnect.
+    this.enableManagement({ version: '1.0.0', configPath });
     this.registerDeviceFull('light.01', 'Desk Lamp', { deviceType: 'light' });
     this.publishAvailability('light.01', true);
     this.publishState('light.01', { on: false, brightness_pct: 0 });
   }
 
   onCommand(deviceId, payload) {
-    // Do whatever the real device needs, then publish what actually happened —
+    // Do whatever the real device needs, then publish what actually happened:
     // homeCore never writes device state itself.
     const state = { on: !!payload.on };
     this.publishStateForCommand(deviceId, state, payload, 'mylight');
   }
 }
 
-new MyLight().run();
+new MyLight({
+  pluginId:   hc.plugin_id,
+  brokerHost: hc.broker_host,
+  brokerPort: hc.broker_port,
+  password:   hc.password,
+}).run();
 ```
 
-`run()` returns the mqtt.js client and keeps running. Point it at a broker with
-constructor options, or the `HC_BROKER_HOST` / `HC_BROKER_PORT` /
-`HC_PLUGIN_PASSWORD` environment variables.
+Take the plugin id from `plugin_id`: homeCore minted the password for that id,
+and the broker refuses any other. Keep your own settings in other tables of the
+same file (`config.mylight`, say), and pass `configPath` to `enableManagement`
+so homeCore's config editor edits that same file.
+
+`run()` returns the mqtt.js client and keeps running. Options left out fall
+back to the `HC_BROKER_HOST` / `HC_BROKER_PORT` / `HC_PLUGIN_PASSWORD`
+environment variables, which are for running a plugin by hand without a config
+file.
 
 ## How a plugin fits into homeCore
 
@@ -103,18 +140,20 @@ Four consequences worth internalising:
 ## Installing it into homeCore
 
 homeCore owns your plugin's config at `config/plugins/<plugin_id>.toml` and
-passes the path as `process.argv[2]`:
+starts the plugin as `<binary> <config path>`, so the path arrives as
+`process.argv[2]`.
 
-```javascript
-const configPath = process.argv[2] || 'config/config.toml';
-```
-
-Declare the plugin in homeCore's `homecore.toml` so it gets supervised:
+Because the config path is the only argument, `binary` has to be something
+that runs your plugin by itself. `/usr/bin/node` won't work: it would try to
+run the config file as JavaScript. Give the plugin's entry file a
+`#!/usr/bin/env node` first line (as above), mark it executable with
+`chmod +x`, and point `binary` at it. Declare the plugin in homeCore's
+`homecore.toml` so it gets supervised:
 
 ```toml
 [[plugins]]
 id      = "plugin.mylight"
-binary  = "/usr/bin/node"
+binary  = "/opt/hc-mylight/mylight.js"
 config  = "config/plugins/plugin.mylight.toml"
 enabled = true
 ```
@@ -134,6 +173,14 @@ onConnect() {
   });
 }
 ```
+
+Calling it again, as `onConnect` does after a reconnect, replaces the heartbeat
+timer, so the plugin keeps exactly one.
+
+An operator can change the plugin's log level from homeCore
+(`set_log_level`). The SDK applies it to log forwarding in place of
+`enableLogForwarding`'s `minLevel`, and calls `onLogLevel(level)` so you can
+apply it to your own logger. `this.logLevel` holds the last level set.
 
 ## Notices — telling the operator what is wrong
 
@@ -493,6 +540,7 @@ the change, so the UI and the audit log can say so.
 | `onState(deviceId, state)` | A device you subscribed to changed |
 | `onSetConfig(config)` | A structured config write |
 | `onApiAccess(url, key, scopes)` | homeCore sent REST access (every start) |
+| `onLogLevel(level)` | An operator changed the log level (`trace` to `error`) |
 | `onStop()` | Stopping. Leave what you control safe; 1 second, may return a promise |
 
 **Stopping.** homeCore and a plugin runtime stop a plugin with SIGTERM, and

@@ -1721,3 +1721,120 @@ describe('stream data and timestamps', () => {
     expect(new StreamContext(plugin, 'r1', 'chat').caller).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Management called from every connect, and the operator's log level
+// ---------------------------------------------------------------------------
+
+describe('management across reconnects', () => {
+  let mockClient;
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+    mockClient = {
+      on: jest.fn(), subscribe: jest.fn(), unsubscribe: jest.fn(), publish: jest.fn(),
+    };
+    mqtt.connect.mockReturnValue(mockClient);
+  });
+  afterEach(() => {
+    jest.useRealTimers();
+    jest.clearAllMocks();
+  });
+
+  const beats = () => mockClient.publish.mock.calls
+    .filter(([t]) => t.endsWith('/heartbeat')).length;
+
+  class Managed extends PluginBase {
+    constructor() { super({ pluginId: 'plugin.test' }); }
+    onConnect() { this.enableManagement({ intervalSecs: 60 }); }
+    onCommand() {}
+  }
+
+  test('enableManagement from onConnect keeps one heartbeat timer', () => {
+    const plugin = new Managed();
+    plugin.run();
+    const connect = mockClient.on.mock.calls.find(([e]) => e === 'connect')[1];
+    connect();
+    connect();
+    connect(); // two reconnects
+
+    mockClient.publish.mockClear();
+    jest.advanceTimersByTime(60 * 1000);
+    expect(beats()).toBe(1);
+    jest.advanceTimersByTime(60 * 1000);
+    expect(beats()).toBe(2);
+  });
+});
+
+describe('set_log_level', () => {
+  let mockClient;
+
+  beforeEach(() => {
+    mockClient = {
+      on: jest.fn(), subscribe: jest.fn(), unsubscribe: jest.fn(), publish: jest.fn(),
+    };
+    mqtt.connect.mockReturnValue(mockClient);
+  });
+  afterEach(() => jest.clearAllMocks());
+
+  const logs = () => mockClient.publish.mock.calls
+    .filter(([t]) => t.endsWith('/logs'))
+    .map(([, p]) => JSON.parse(p).level);
+  const responses = () => mockClient.publish.mock.calls
+    .filter(([t]) => t.endsWith('/manage/response'))
+    .map(([, p]) => JSON.parse(p));
+  const send = (body) => {
+    const handler = mockClient.on.mock.calls.find(([e]) => e === 'message')[1];
+    handler(
+      'homecore/plugins/plugin.test/manage/cmd',
+      Buffer.from(JSON.stringify({ request_id: 'r1', action: 'set_log_level', ...body })),
+    );
+  };
+  const managed = () => {
+    const plugin = new TestPlugin();
+    plugin.run();
+    plugin.enableManagement({ intervalSecs: 3600 });
+    plugin.enableLogForwarding('info');
+    return plugin;
+  };
+
+  test('lowering the level forwards what was held back', () => {
+    const plugin = managed();
+    plugin.logDebug('before');
+    expect(logs()).toEqual([]);
+
+    send({ level: 'debug' });
+    expect(responses().pop().status).toBe('ok');
+    expect(plugin.logLevel).toBe('debug');
+    plugin.logDebug('after');
+    expect(logs()).toEqual(['DEBUG']);
+  });
+
+  test('raising the level holds back what was forwarded', () => {
+    const plugin = managed();
+    send({ level: 'WARNING' });
+    expect(plugin.logLevel).toBe('warn');
+    plugin.logInfo('quiet now');
+    plugin.logWarn('still said');
+    expect(logs()).toEqual(['WARN']);
+  });
+
+  test('an unknown level is refused and changes nothing', () => {
+    const plugin = managed();
+    send({ level: 'loud' });
+    const resp = responses().pop();
+    expect(resp.status).toBe('error');
+    expect(resp.error).toMatch(/unknown level/);
+    expect(plugin.logLevel).toBeNull();
+    plugin.logInfo('still forwarded');
+    expect(logs()).toEqual(['INFO']);
+  });
+
+  test('onLogLevel hears the new level', () => {
+    const plugin = managed();
+    const heard = [];
+    plugin.onLogLevel = (level) => heard.push(level);
+    send({ level: 'Error' });
+    expect(heard).toEqual(['error']);
+  });
+});
