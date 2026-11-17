@@ -283,10 +283,10 @@ async onAction(action, params, ctx) {
 
 | Stage | Meaning |
 |---|---|
-| `ctx.progress({...})` | percent / label / message, as often as useful |
+| `ctx.progress({...})` | percent / label / message / data, as often as useful |
 | `ctx.itemAdd/itemUpdate/itemRemove(data)` | one thing found or changed — include the `itemKey` field so the UI updates a row rather than appending |
 | `ctx.warning(msg)` | recoverable; **the stream continues** |
-| `ctx.awaitingUser(prompt)` | ask for something, then `await ctx.awaitRespond()` |
+| `ctx.awaitingUser(prompt, responseSchema, data)` | ask for something, then `await ctx.awaitRespond()` |
 | `ctx.complete(data)` | terminal, success |
 | `ctx.error(msg)` | terminal, failure |
 | `ctx.canceled()` | terminal, after you notice `isCanceled()` |
@@ -301,6 +301,65 @@ on a stream that quietly stopped.
 ctx.awaitingUser('Press the pairing button on the device now.');
 const answer = await ctx.awaitRespond(60000);
 ```
+
+`progress` and `awaitingUser` also take `data`, an object a plugin's own screen
+reads from the stream (text as it is written, a preview to confirm). The
+generic UI ignores it.
+
+```javascript
+ctx.progress({ message: 'Writing', data: { text: soFar } });
+ctx.awaitingUser('Apply this change?', null, { preview: diff });
+```
+
+Each event's `ts` is later than the one before it on the same stream, by at
+least a microsecond, so a reader that skips an event whose `ts` it has already
+seen never loses one.
+
+### Who called
+
+homeCore passes the verified caller with every action: `{ uid, username, role,
+scopes, kind }` (`kind` is `user`, `api_key`, `local_admin` or `whitelist`).
+It is never mixed into `params`. A streaming handler reads `ctx.caller`; any
+handler also gets it as a fourth argument. Handlers written with three
+parameters keep working.
+
+```javascript
+onAction(action, params, ctx, caller) {
+  if (action === 'whoami') return { name: caller ? caller.username : null };
+  return null;
+}
+```
+
+Most actions still need an admin (`plugins:write`), whatever role they declare.
+An action declared with `requiresRole: RequiresRole.SIGNED_IN` can be called by
+anyone signed in, household members and read-only accounts included, so use
+`caller.scopes` to stay within what that person may do.
+
+## REST access from homeCore
+
+A plugin that needs homeCore's REST API asks for scopes in its manifest, and
+homeCore mints it a key on every start. Nothing to paste, nothing stored in the
+config file.
+
+```javascript
+new Capabilities([...], { apiScopes: ['devices:read', 'devices:command'] });
+```
+
+The key arrives with the `api_access` management action. The SDK keeps it in
+`this.apiAccess` (`url`, `key`, `scopes`; the key never shows when the object
+is logged or turned into JSON) and calls your hook:
+
+```javascript
+onApiAccess(url, key, scopes) {
+  this.rest = new MyClient(url, key);   // url already ends in /api/v1
+}
+
+// or, anywhere async:
+const access = await this.waitForApiAccess(30000);   // null on timeout
+```
+
+homeCore leaves out scopes no plugin may hold (`users:write`,
+`api_keys:admin`), so check `scopes` rather than assuming you got everything.
 
 ## Cross-device plugins
 
@@ -422,6 +481,7 @@ the change, so the UI and the audit log can say so.
 | `enableDevicePersistence(path)` | Remember registered devices across restarts |
 | `reconcileDevices(live)` | Unregister everything not in the live set |
 | `stop()` | `onStop()`, every device offline, the plugin offline, disconnect |
+| `apiAccess` / `waitForApiAccess(timeoutMs)` | REST access homeCore granted, or `null` |
 
 ### Hooks to override
 
@@ -429,9 +489,10 @@ the change, so the UI and the audit log can say so.
 |---|---|
 | `onConnect()` | Connected. Register devices, enable management |
 | `onCommand(deviceId, payload)` | A command for one of your devices |
-| `onAction(action, params, ctx)` | A capability action; `ctx` only when streaming |
+| `onAction(action, params, ctx, caller)` | A capability action; `ctx` only when streaming, `caller` optional |
 | `onState(deviceId, state)` | A device you subscribed to changed |
 | `onSetConfig(config)` | A structured config write |
+| `onApiAccess(url, key, scopes)` | homeCore sent REST access (every start) |
 | `onStop()` | Stopping. Leave what you control safe; 1 second, may return a promise |
 
 **Stopping.** homeCore and a plugin runtime stop a plugin with SIGTERM, and
