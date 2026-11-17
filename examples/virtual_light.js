@@ -18,6 +18,14 @@
  *   node examples/virtual_light.js
  *   node examples/virtual_light.js --broker 192.168.1.10 --port 1883
  *   HC_BROKER_HOST=192.168.1.10 node examples/virtual_light.js
+ *
+ * The flags are for trying it against a broker by hand. homeCore starts a
+ * plugin with one argument, its config file, and a real plugin reads the
+ * broker, plugin id and password from that file's [homecore] table. The
+ * README's "Your first plugin" shows how.
+ *
+ * Ctrl-C and SIGTERM are the SDK's: they mark the light and the plugin offline
+ * and disconnect. Anything to do first goes in onStop().
  */
 
 const { PluginBase } = require('../index');
@@ -72,8 +80,10 @@ class VirtualLightPlugin extends PluginBase {
 
     console.log(`[${this.pluginId}] Device registered — initial state:`, this._state());
 
-    // Periodic toggle every 5 seconds.
-    setInterval(() => {
+    // Periodic toggle every 5 seconds. onConnect runs again on every
+    // reconnect, so start the timer only once.
+    if (this._tick) return;
+    this._tick = setInterval(() => {
       this._on       = !this._on;
       this._levelPct = (this._levelPct % 100) + 10;
       console.log(`[${this.pluginId}] Periodic tick — state:`, this._state());
@@ -113,12 +123,4 @@ console.log(`  Device ID : ${DEVICE_ID}`);
 console.log(`  Broker    : ${plugin.brokerHost}:${plugin.brokerPort}`);
 console.log('Press Ctrl-C to stop');
 
-const client = plugin.run();
-
-// Publish offline on graceful shutdown.
-process.on('SIGINT', () => {
-  console.log('\nShutting down…');
-  plugin.publishAvailability(DEVICE_ID, false);
-  plugin.publishPluginStatus('offline');
-  setTimeout(() => { client.end(true); process.exit(0); }, 300);
-});
+plugin.run();
