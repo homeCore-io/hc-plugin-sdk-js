@@ -470,6 +470,9 @@ class PluginBase {
     }
     this._publishCapabilities();
 
+    // onConnect runs on every reconnect, and the README says to call this
+    // from there: replace the timer rather than adding one per reconnect.
+    if (this._heartbeatTimer) clearInterval(this._heartbeatTimer);
     this._heartbeatTimer = setInterval(
       () => this._publishHeartbeat(),
       intervalSecs * 1000,
@@ -596,6 +599,15 @@ class PluginBase {
   }
 
   /**
+   * The log level an operator last set from homeCore (`set_log_level`), or
+   * `null` if none has been set. Once set, it is the forwarding threshold in
+   * place of `enableLogForwarding`'s `minLevel`.
+   *
+   * @type {string|null}
+   */
+  get logLevel() { return this._logLevel; }
+
+  /**
    * Forward a log line to MQTT (QoS 0, not retained).
    *
    * @param {string} level   - Log level (error, warn, info, debug, trace).
@@ -604,7 +616,8 @@ class PluginBase {
    */
   forwardLog(level, message, fields = null) {
     if (!this._logForwardEnabled) return;
-    if (PluginBase._logLevelValue(level) < PluginBase._logLevelValue(this._logForwardLevel)) return;
+    const threshold = this._logLevel || this._logForwardLevel;
+    if (PluginBase._logLevelValue(level) < PluginBase._logLevelValue(threshold)) return;
     const payload = {
       timestamp: new Date().toISOString(),
       level: level.toUpperCase(),
@@ -673,7 +686,6 @@ class PluginBase {
    * @param {string} deviceId - The target device.
    * @param {object} payload  - Decoded JSON command payload.
    */
-  // eslint-disable-next-line no-unused-vars
   onCommand(deviceId, payload) {
     throw new Error(`${this.constructor.name} must implement onCommand(deviceId, payload)`);
   }
@@ -711,7 +723,6 @@ class PluginBase {
    *   homeCore that sent it is too old to say.
    * @returns {object|Promise<object>|null}
    */
-  // eslint-disable-next-line no-unused-vars
   onAction(action, params, ctx, caller) { return null; }
 
   /**
@@ -728,7 +739,6 @@ class PluginBase {
    * @param {string} key
    * @param {string[]} scopes
    */
-  // eslint-disable-next-line no-unused-vars
   onApiAccess(url, key, scopes) {}
 
   /**
@@ -737,7 +747,6 @@ class PluginBase {
    * Only for cross-device consumers. Devices this plugin owns arrive through
    * {@link PluginBase#onCommand} instead.
    */
-  // eslint-disable-next-line no-unused-vars
   onState(deviceId, state) {}
 
   /**
@@ -751,8 +760,17 @@ class PluginBase {
    * @param {object} config - The structured config.
    * @returns {boolean} true if you handled and persisted it.
    */
-  // eslint-disable-next-line no-unused-vars
   onSetConfig(config) { return false; }
+
+  /**
+   * Called when an operator changes this plugin's log level from homeCore.
+   *
+   * The SDK already applies `level` to log forwarding. Override this to apply
+   * it to your own logger too (pino, winston, a console wrapper).
+   *
+   * @param {string} level - One of trace, debug, info, warn, error.
+   */
+  onLogLevel(level) {}
 
   /**
    * Called once when the plugin is stopping, before it says goodbye.
@@ -1012,10 +1030,21 @@ class PluginBase {
         break;
       }
 
-      case 'set_log_level':
-        this._logLevel = cmd.level;
+      case 'set_log_level': {
+        const level = PluginBase._normalizeLogLevel(cmd.level ?? 'info');
+        if (!level) {
+          this._respond(requestId, { error: `unknown level: ${cmd.level}` });
+          break;
+        }
+        this._logLevel = level;
+        try {
+          this.onLogLevel(level);
+        } catch (err) {
+          console.error(`[${this.pluginId}] onLogLevel failed:`, err && err.message);
+        }
         this._respond(requestId);
         break;
+      }
 
       default:
         this._dispatchAction(cmd, requestId);
@@ -1205,6 +1234,14 @@ class PluginBase {
     if (isNew && this._client) {
       this._client.subscribe(`homecore/devices/${deviceId}/cmd`, { qos: 1 });
     }
+  }
+
+  /** `level` as one of trace/debug/info/warn/error, or null if it is none. */
+  static _normalizeLogLevel(level) {
+    if (typeof level !== 'string') return null;
+    const name = level.toLowerCase();
+    if (name === 'warning') return 'warn';
+    return PluginBase._logLevelValue(name) ? name : null;
   }
 
   static _logLevelValue(level) {
