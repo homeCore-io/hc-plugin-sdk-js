@@ -35,6 +35,7 @@ const {
   Action, Capabilities, Concurrency, ItemOp, RequiresRole,
 } = require('./lib/capabilities');
 const { StreamContext, StreamTerminated } = require('./lib/streaming');
+const { ApiAccess } = require('./lib/access');
 const {
   AlertSeverity, AlertActionTarget, AlertAction, PluginAlertKind, PluginAlert,
 } = require('./lib/alerts');
@@ -48,7 +49,7 @@ const stopping = require('./lib/stopping');
  * operator which SDK to rebuild against; it is not what core checks
  * compatibility on.
  */
-const SDK_VERSION = '0.4.4';
+const SDK_VERSION = '0.4.5';
 
 /**
  * The wire protocol this SDK speaks, which is core's hc-types version. Core
@@ -120,6 +121,12 @@ class PluginBase {
 
     /** @type {Promise<void>|null} set once stop() has begun */
     this._stopping = null;
+
+    // REST access from core, once it has sent it (see onApiAccess), and
+    // whoever is waiting for it in waitForApiAccess.
+    /** @type {ApiAccess|null} */
+    this._apiAccess = null;
+    this._apiAccessWaiters = [];
   }
 
   // ---------------------------------------------------------------------------
@@ -621,6 +628,40 @@ class PluginBase {
   /** Convenience: forward a debug log. */
   logDebug(msg, fields) { this.forwardLog('debug', msg, fields); }
 
+  /**
+   * The REST access homeCore granted, or `null` until it arrives.
+   *
+   * Only a plugin whose manifest declares `apiScopes` (see
+   * {@link Capabilities}) is sent one.
+   *
+   * @type {ApiAccess|null}
+   */
+  get apiAccess() { return this._apiAccess; }
+
+  /**
+   * Resolves once homeCore has sent REST access, or after `timeoutMs`.
+   *
+   * @param {number} [timeoutMs] - Give up after this long. Omit to wait for
+   *   as long as it takes.
+   * @returns {Promise<ApiAccess|null>} The access, or `null` on timeout.
+   */
+  waitForApiAccess(timeoutMs = null) {
+    if (this._apiAccess) return Promise.resolve(this._apiAccess);
+    return new Promise((resolve) => {
+      const waiter = { resolve, timer: null };
+      if (timeoutMs != null) {
+        waiter.timer = setTimeout(() => {
+          const i = this._apiAccessWaiters.indexOf(waiter);
+          if (i >= 0) this._apiAccessWaiters.splice(i, 1);
+          resolve(this._apiAccess);
+        }, timeoutMs);
+        // Do not hold the process open just to wait on core.
+        if (waiter.timer.unref) waiter.timer.unref();
+      }
+      this._apiAccessWaiters.push(waiter);
+    });
+  }
+
   // ---------------------------------------------------------------------------
   // Subclass hooks
   // ---------------------------------------------------------------------------
@@ -655,13 +696,40 @@ class PluginBase {
    * Returning `null`/`undefined` from an *immediate* action tells the SDK you
    * do not recognise the id, and it answers with `unknown action`.
    *
+   * **Who called.** homeCore says who made each request:
+   * `{ uid, username, role, scopes, kind }`, where `kind` is `user`,
+   * `api_key`, `local_admin` or `whitelist`. It arrives as the fourth
+   * argument, and a streaming action can also read it as `ctx.caller`.
+   * Handlers written with three parameters keep working; they just do not
+   * hear who called.
+   *
    * @param {string} action - The action id.
-   * @param {object} params - Everything the command carried but the envelope.
+   * @param {object} params - Everything the command carried but the envelope
+   *   and the caller.
    * @param {StreamContext|null} ctx - Present only for streaming actions.
+   * @param {object|null} [caller] - Who made the request, or `null` when the
+   *   homeCore that sent it is too old to say.
    * @returns {object|Promise<object>|null}
    */
   // eslint-disable-next-line no-unused-vars
-  onAction(action, params, ctx) { return null; }
+  onAction(action, params, ctx, caller) { return null; }
+
+  /**
+   * homeCore has sent this plugin REST access: its API base `url` (already
+   * ending in `/api/v1`, with no trailing slash), a bearer `key`, and the
+   * `scopes` the key carries.
+   *
+   * Arrives after every start (the key is reminted each time, and the old one
+   * revoked), so replace whatever client you built from the last one. The
+   * default does nothing; {@link PluginBase#apiAccess} holds the same values
+   * either way.
+   *
+   * @param {string} url
+   * @param {string} key
+   * @param {string[]} scopes
+   */
+  // eslint-disable-next-line no-unused-vars
+  onApiAccess(url, key, scopes) {}
 
   /**
    * A device you subscribed to with {@link PluginBase#subscribeState} changed.
@@ -918,6 +986,10 @@ class PluginBase {
         this._handleSetConfig(cmd, requestId);
         break;
 
+      case 'api_access':
+        this._handleApiAccess(cmd, requestId);
+        break;
+
       case 'cancel': {
         const ctx = this._activeStreams.get(cmd.target_request_id);
         if (!ctx) {
@@ -992,26 +1064,68 @@ class PluginBase {
     }
   }
 
+  /**
+   * Keep the REST access core sent and tell the plugin.
+   *
+   * Core sends the fields at the top level of the management payload; a
+   * nested `params` object is accepted too.
+   */
+  _handleApiAccess(cmd, requestId) {
+    const body = isPlainObject(cmd.params) ? cmd.params : cmd;
+    const { url, key } = body;
+    if (typeof url !== 'string' || !url || typeof key !== 'string' || !key) {
+      this._respond(requestId, { error: 'api_access needs a url and a key' });
+      return;
+    }
+    const scopes = Array.isArray(body.scopes) ? body.scopes.map(String) : [];
+    const access = new ApiAccess({ url: url.replace(/\/+$/, ''), key, scopes });
+    this._apiAccess = access;
+    console.info(
+      `[${this.pluginId}] homeCore granted REST access at ${access.url} (${scopes.length} scopes)`,
+    );
+    try {
+      const hook = this.onApiAccess(access.url, key, scopes);
+      if (hook && typeof hook.catch === 'function') {
+        hook.catch((err) => {
+          console.error(`[${this.pluginId}] onApiAccess failed:`, err && err.message);
+        });
+      }
+    } catch (err) {
+      console.error(`[${this.pluginId}] onApiAccess failed:`, err && err.message);
+    }
+    const waiters = this._apiAccessWaiters;
+    this._apiAccessWaiters = [];
+    for (const waiter of waiters) {
+      if (waiter.timer) clearTimeout(waiter.timer);
+      waiter.resolve(access);
+    }
+    this._respond(requestId);
+  }
+
   /** Route a management command that is not a built-in to {@link PluginBase#onAction}. */
   _dispatchAction(cmd, requestId) {
     const declared = this._capabilities
       ? this._capabilities.actions.find((a) => a.id === cmd.action)
       : undefined;
 
-    // Params are everything that is not protocol envelope.
+    // Params are everything that is not protocol envelope. `caller` is who
+    // core verified made the request; it is never a param.
     const params = { ...cmd };
     delete params.action;
     delete params.request_id;
     delete params.target_request_id;
+    delete params.caller;
+    const caller = isPlainObject(cmd.caller) ? cmd.caller : null;
 
     if (declared && declared.stream) {
-      this._startStream(declared, requestId, params);
+      this._startStream(declared, requestId, params, caller);
       return;
     }
 
     let result;
     try {
-      result = this.onAction(cmd.action, params, null);
+      // A handler written with three parameters ignores the fourth.
+      result = this.onAction(cmd.action, params, null, caller);
     } catch (err) {
       this._respond(requestId, { error: `action failed: ${err.message || err}` });
       return;
@@ -1030,7 +1144,7 @@ class PluginBase {
   }
 
   /** Run a streaming action and answer `accepted` straight away. */
-  _startStream(declared, requestId, params) {
+  _startStream(declared, requestId, params, caller = null) {
     if (!requestId) {
       this._respond('', { error: 'streaming action requires request_id' });
       return;
@@ -1045,13 +1159,13 @@ class PluginBase {
       }
     }
 
-    const ctx = new StreamContext(this, requestId, declared.id);
+    const ctx = new StreamContext(this, requestId, declared.id, caller);
     this._activeStreams.set(requestId, ctx);
 
     // The handler may be async. Whatever happens, exactly one terminal stage
     // must land and the retained topic must be cleared.
     Promise.resolve()
-      .then(() => this.onAction(declared.id, params, ctx))
+      .then(() => this.onAction(declared.id, params, ctx, caller))
       .then(
         () => ctx._finalize(null),
         (err) => ctx._finalize(err),
@@ -1112,6 +1226,11 @@ class PluginBase {
   }
 }
 
+/** A JSON object: not null, not an array. */
+function isPlainObject(v) {
+  return v != null && typeof v === 'object' && !Array.isArray(v);
+}
+
 module.exports = {
   PluginBase,
   // Notices
@@ -1133,6 +1252,8 @@ module.exports = {
   // Streaming actions
   StreamContext,
   StreamTerminated,
+  // REST access core grants the plugin
+  ApiAccess,
   // The plugin's own screens
   ui,
   PluginUi: ui.PluginUi,

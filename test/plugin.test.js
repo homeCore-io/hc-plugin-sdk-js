@@ -1407,3 +1407,317 @@ describe('stop', () => {
       'homecore/plugins/plugin.test/status', 'offline', expect.anything(), expect.anything());
   });
 });
+
+// ---------------------------------------------------------------------------
+// Who called, REST access from homeCore, stream data and timestamps
+// ---------------------------------------------------------------------------
+
+describe('who called', () => {
+  const { RequiresRole } = require('../index');
+  let mockClient;
+
+  const responses = () => mockClient.publish.mock.calls
+    .filter(([t]) => t.endsWith('/manage/response'))
+    .map(([, p]) => JSON.parse(p));
+
+  beforeEach(() => {
+    mockClient = {
+      on: jest.fn(), subscribe: jest.fn(), unsubscribe: jest.fn(), publish: jest.fn(),
+    };
+    mqtt.connect.mockReturnValue(mockClient);
+  });
+  afterEach(() => jest.clearAllMocks());
+
+  class CallerPlugin extends TestPlugin {
+    constructor() {
+      super();
+      this.seen = [];
+    }
+
+    onAction(action, params, ctx, caller) {
+      this.seen.push({ action, params, ctx, caller });
+      if (action === 'whoami') return { name: caller ? caller.username : null };
+      if (action === 'stream') ctx.complete({});
+      return null;
+    }
+  }
+
+  // Written before callers existed: three parameters.
+  class OldPlugin extends TestPlugin {
+    onAction(action, params) {
+      return { echo: params };
+    }
+  }
+
+  const setup = (PluginClass) => {
+    const plugin = new PluginClass();
+    plugin.run();
+    plugin.enableManagement({
+      intervalSecs: 3600,
+      capabilities: new Capabilities([
+        new Action({ id: 'whoami', label: 'Who am I', requiresRole: RequiresRole.SIGNED_IN }),
+        new Action({ id: 'stream', label: 'Stream', stream: true }),
+      ]),
+    });
+    return plugin;
+  };
+
+  const send = (body) => {
+    const handler = mockClient.on.mock.calls.find(([e]) => e === 'message')[1];
+    handler(
+      'homecore/plugins/plugin.test/manage/cmd',
+      Buffer.from(JSON.stringify({ request_id: 'r1', ...body })),
+    );
+  };
+
+  const settle = async () => {
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+  };
+
+  const CALLER = {
+    uid: 'u1', username: 'ann', role: 'user', scopes: ['devices:read'], kind: 'user',
+  };
+
+  test('an immediate handler gets the caller, never as a param', async () => {
+    const plugin = setup(CallerPlugin);
+    send({ action: 'whoami', caller: CALLER, value: 1 });
+    await settle();
+    expect(responses().pop()).toMatchObject({ status: 'ok', name: 'ann' });
+    expect(plugin.seen[0].caller).toEqual(CALLER);
+    expect(plugin.seen[0].params).toEqual({ value: 1 });
+  });
+
+  test('a stream context carries the caller', async () => {
+    const plugin = setup(CallerPlugin);
+    send({ action: 'stream', caller: CALLER });
+    await settle();
+    expect(plugin.seen[0].ctx.caller).toEqual(CALLER);
+    expect(plugin.seen[0].params).toEqual({});
+  });
+
+  test('no caller, or one that is not an object, is null', async () => {
+    const plugin = setup(CallerPlugin);
+    send({ action: 'whoami' });
+    send({ action: 'whoami', caller: 'ann' });
+    send({ action: 'whoami', caller: ['ann'] });
+    send({ action: 'stream', caller: 7 });
+    await settle();
+    expect(plugin.seen.map((s) => s.caller)).toEqual([null, null, null, null]);
+    expect(plugin.seen[3].ctx.caller).toBeNull();
+    expect(plugin.seen[1].params).toEqual({});
+  });
+
+  test('a handler written without a caller keeps working', async () => {
+    setup(OldPlugin);
+    send({ action: 'whoami', caller: CALLER, value: 2 });
+    await settle();
+    expect(responses().pop()).toMatchObject({ status: 'ok', echo: { value: 2 } });
+  });
+
+  test('signed_in is a role an action can declare', () => {
+    expect(RequiresRole.SIGNED_IN).toBe('signed_in');
+    expect(new Action({ id: 'a', label: 'A', requiresRole: RequiresRole.SIGNED_IN })
+      .toJSON().requires_role).toBe('signed_in');
+  });
+});
+
+describe('REST access from homeCore', () => {
+  const util = require('util');
+  const { ApiAccess } = require('../index');
+  let mockClient;
+
+  const responses = () => mockClient.publish.mock.calls
+    .filter(([t]) => t.endsWith('/manage/response'))
+    .map(([, p]) => JSON.parse(p));
+
+  beforeEach(() => {
+    mockClient = {
+      on: jest.fn(), subscribe: jest.fn(), unsubscribe: jest.fn(), publish: jest.fn(),
+    };
+    mqtt.connect.mockReturnValue(mockClient);
+    jest.spyOn(console, 'info').mockImplementation(() => {});
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  class RestPlugin extends TestPlugin {
+    constructor() {
+      super();
+      this.granted = [];
+    }
+
+    onApiAccess(url, key, scopes) {
+      this.granted.push({ url, key, scopes });
+    }
+  }
+
+  const setup = (PluginClass = RestPlugin, capabilities = new Capabilities([])) => {
+    const plugin = new PluginClass();
+    plugin.run();
+    plugin.enableManagement({ intervalSecs: 3600, capabilities });
+    return plugin;
+  };
+
+  const send = (body) => {
+    const handler = mockClient.on.mock.calls.find(([e]) => e === 'message')[1];
+    handler(
+      'homecore/plugins/plugin.test/manage/cmd',
+      Buffer.from(JSON.stringify({ request_id: 'r1', ...body })),
+    );
+  };
+
+  const manifest = () => JSON.parse(mockClient.publish.mock.calls
+    .filter(([t]) => t.endsWith('/capabilities')).pop()[1]);
+
+  test('api scopes ride on the manifest only when there are some', () => {
+    setup(RestPlugin, new Capabilities([], { apiScopes: ['devices:read', 'devices:command'] }));
+    expect(manifest().api_scopes).toEqual(['devices:read', 'devices:command']);
+    mockClient.publish.mockClear();
+    setup(RestPlugin, new Capabilities([]));
+    expect(manifest()).not.toHaveProperty('api_scopes');
+  });
+
+  test('access is kept, the hook is called, and the answer is ok', () => {
+    const plugin = setup();
+    expect(plugin.apiAccess).toBeNull();
+    send({
+      action: 'api_access',
+      url: 'http://127.0.0.1:8080/api/v1/',
+      key: 'hc_sk_secret',
+      scopes: ['devices:read'],
+    });
+    expect(plugin.apiAccess).toBeInstanceOf(ApiAccess);
+    expect(plugin.apiAccess.url).toBe('http://127.0.0.1:8080/api/v1');
+    expect(plugin.apiAccess.key).toBe('hc_sk_secret');
+    expect(plugin.apiAccess.scopes).toEqual(['devices:read']);
+    expect(plugin.granted).toEqual([{
+      url: 'http://127.0.0.1:8080/api/v1', key: 'hc_sk_secret', scopes: ['devices:read'],
+    }]);
+    expect(responses().pop()).toEqual({ request_id: 'r1', status: 'ok' });
+    expect(console.info).toHaveBeenCalledWith(
+      '[plugin.test] homeCore granted REST access at http://127.0.0.1:8080/api/v1 (1 scopes)',
+    );
+  });
+
+  test('a nested params object is accepted', () => {
+    const plugin = setup();
+    send({ action: 'api_access', params: { url: 'http://h/api/v1', key: 'k' } });
+    expect(plugin.apiAccess.url).toBe('http://h/api/v1');
+    expect(plugin.apiAccess.scopes).toEqual([]);
+    expect(responses().pop().status).toBe('ok');
+  });
+
+  test('without a url or a key it is an error', () => {
+    const plugin = setup();
+    send({ action: 'api_access', url: 'http://h/api/v1' });
+    expect(responses().pop()).toMatchObject({
+      status: 'error', error: 'api_access needs a url and a key',
+    });
+    send({ action: 'api_access', key: 'k' });
+    expect(responses().pop().error).toBe('api_access needs a url and a key');
+    expect(plugin.apiAccess).toBeNull();
+    expect(plugin.granted).toEqual([]);
+  });
+
+  test('the key never shows when the access is logged or stringified', () => {
+    const plugin = setup();
+    send({ action: 'api_access', url: 'http://h/api/v1', key: 'hc_sk_secret', scopes: ['a'] });
+    const access = plugin.apiAccess;
+    expect(JSON.stringify(access)).not.toContain('hc_sk_secret');
+    expect(util.inspect(access)).not.toContain('hc_sk_secret');
+    expect(util.format('%o', access)).not.toContain('hc_sk_secret');
+    expect(Object.keys(access)).toEqual(['url', 'scopes']);
+    expect(JSON.parse(JSON.stringify(access))).toEqual({ url: 'http://h/api/v1', scopes: ['a'] });
+    for (const [msg] of console.info.mock.calls) expect(msg).not.toContain('hc_sk_secret');
+  });
+
+  test('a hook that throws is logged and the answer is still ok', () => {
+    class Broken extends TestPlugin {
+      onApiAccess() { throw new Error('hook failed'); }
+    }
+    const plugin = setup(Broken);
+    send({ action: 'api_access', url: 'http://h/api/v1', key: 'k' });
+    expect(plugin.apiAccess.key).toBe('k');
+    expect(console.error).toHaveBeenCalled();
+    expect(responses().pop().status).toBe('ok');
+  });
+
+  test('waitForApiAccess resolves when access arrives', async () => {
+    const plugin = setup();
+    const pending = plugin.waitForApiAccess(2000);
+    send({ action: 'api_access', url: 'http://h/api/v1', key: 'k' });
+    const access = await pending;
+    expect(access.url).toBe('http://h/api/v1');
+    // Once it is here, waiting returns it at once.
+    await expect(plugin.waitForApiAccess(10)).resolves.toBe(access);
+  });
+
+  test('waitForApiAccess gives null on timeout', async () => {
+    const plugin = setup();
+    await expect(plugin.waitForApiAccess(10)).resolves.toBeNull();
+    expect(plugin._apiAccessWaiters).toEqual([]);
+  });
+});
+
+describe('stream data and timestamps', () => {
+  let published;
+  const plugin = {
+    pluginId: 'plugin.test',
+    _publish: (topic, payload) => published.push(payload),
+  };
+  const events = () => published.filter((p) => p !== '').map((p) => JSON.parse(p));
+
+  beforeEach(() => { published = []; });
+
+  test('progress and awaitingUser carry data when given', () => {
+    const ctx = new StreamContext(plugin, 'r1', 'chat');
+    ctx.progress({ message: 'writing', data: { text: 'Hel' } });
+    ctx.progress({ percent: 10 });
+    ctx.awaitingUser('Apply this?', { type: 'object' }, { preview: 'diff' });
+    ctx.awaitingUser('Press the button');
+    const [p1, p2, a1, a2] = events();
+    expect(p1.data).toEqual({ text: 'Hel' });
+    expect(p2).not.toHaveProperty('data');
+    expect(a1).toMatchObject({ response_schema: { type: 'object' }, data: { preview: 'diff' } });
+    expect(a2).not.toHaveProperty('data');
+    expect(a2).not.toHaveProperty('response_schema');
+  });
+
+  test('ts is strictly increasing, with microseconds, even in one millisecond', () => {
+    const now = jest.spyOn(Date, 'now').mockReturnValue(Date.UTC(2026, 10, 17, 12, 0, 0, 5));
+    const ctx = new StreamContext(plugin, 'r1', 'chat');
+    for (let i = 0; i < 5; i += 1) ctx.progress({ message: String(i) });
+    ctx._finalize(null);
+    now.mockRestore();
+    const ts = events().map((e) => e.ts);
+    expect(ts).toEqual([
+      '2026-11-17T12:00:00.005000Z',
+      '2026-11-17T12:00:00.005001Z',
+      '2026-11-17T12:00:00.005002Z',
+      '2026-11-17T12:00:00.005003Z',
+      '2026-11-17T12:00:00.005004Z',
+      // The synthetic error for a dropped stream follows the same rule.
+      '2026-11-17T12:00:00.005005Z',
+    ]);
+    expect(events().pop().data.reason).toBe('plugin_dropped_stream');
+  });
+
+  test('ts never goes backwards when the clock does', () => {
+    const now = jest.spyOn(Date, 'now');
+    const ctx = new StreamContext(plugin, 'r1', 'chat');
+    now.mockReturnValueOnce(Date.UTC(2026, 10, 17, 12, 0, 1));
+    ctx.progress({});
+    now.mockReturnValueOnce(Date.UTC(2026, 10, 17, 12, 0, 0));
+    ctx.complete({});
+    now.mockRestore();
+    expect(events().map((e) => e.ts)).toEqual([
+      '2026-11-17T12:00:01.000000Z',
+      '2026-11-17T12:00:01.000001Z',
+    ]);
+  });
+
+  test('the caller defaults to null', () => {
+    expect(new StreamContext(plugin, 'r1', 'chat').caller).toBeNull();
+  });
+});
