@@ -5,7 +5,7 @@
   "main": "index.js",
   "license": "MIT OR Apache-2.0",
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "dependencies": {
     "mqtt": "^5.0.0"
