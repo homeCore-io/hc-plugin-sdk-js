@@ -1,6 +1,6 @@
 {
   "name": "homecore-plugin-sdk",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "description": "Node.js SDK for homeCore device plugins",
   "main": "index.js",
   "license": "MIT OR Apache-2.0",

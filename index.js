@@ -41,6 +41,7 @@ const {
 } = require('./lib/alerts');
 const { DeviceTracker, scopedSnapshotPath } = require('./lib/persistence');
 const ui = require('./lib/ui');
+const upload = require('./lib/upload');
 const supervised = require('./lib/supervised');
 const stopping = require('./lib/stopping');
 
@@ -984,6 +985,13 @@ class PluginBase {
         this._handleUiFile(cmd, requestId);
         break;
 
+      // A piece of a file sent to an action (POST /plugins/{id}/upload/{action}).
+      case 'upload_chunk': {
+        const refused = upload.chunk(cmd);
+        this._respond(requestId, refused ? { error: refused } : {});
+        break;
+      }
+
       case 'get_config':
         if (this._configPath) {
           try {
@@ -1146,8 +1154,20 @@ class PluginBase {
     delete params.caller;
     const caller = isPlainObject(cmd.caller) ? cmd.caller : null;
 
+    // A file sent with it: the action reads it from file_path.
+    let sentFile = null;
+    if (params.upload) {
+      sentFile = upload.pathFor(cmd);
+      delete params.upload;
+      if (!sentFile) {
+        this._respond(requestId, { error: 'the file did not arrive whole' });
+        return;
+      }
+      params.file_path = sentFile;
+    }
+
     if (declared && declared.stream) {
-      this._startStream(declared, requestId, params, caller);
+      this._startStream(declared, requestId, params, caller, sentFile);
       return;
     }
 
@@ -1156,25 +1176,31 @@ class PluginBase {
       // A handler written with three parameters ignores the fourth.
       result = this.onAction(cmd.action, params, null, caller);
     } catch (err) {
+      upload.remove(sentFile);
       this._respond(requestId, { error: `action failed: ${err.message || err}` });
       return;
     }
 
     Promise.resolve(result).then(
       (value) => {
+        upload.remove(sentFile);
         if (value == null) {
           this._respond(requestId, { error: `unknown action: ${cmd.action}` });
         } else {
           this._respond(requestId, { extra: value });
         }
       },
-      (err) => this._respond(requestId, { error: `action failed: ${err.message || err}` }),
+      (err) => {
+        upload.remove(sentFile);
+        this._respond(requestId, { error: `action failed: ${err.message || err}` });
+      },
     );
   }
 
   /** Run a streaming action and answer `accepted` straight away. */
-  _startStream(declared, requestId, params, caller = null) {
+  _startStream(declared, requestId, params, caller = null, sentFile = null) {
     if (!requestId) {
+      upload.remove(sentFile);
       this._respond('', { error: 'streaming action requires request_id' });
       return;
     }
@@ -1182,6 +1208,7 @@ class PluginBase {
     if (declared.concurrency === Concurrency.SINGLE) {
       for (const [rid, ctx] of this._activeStreams) {
         if (ctx.actionId === declared.id) {
+          upload.remove(sentFile);
           this._respond(requestId, { status: 'busy', extra: { active_request_id: rid } });
           return;
         }
@@ -1199,7 +1226,11 @@ class PluginBase {
         () => ctx._finalize(null),
         (err) => ctx._finalize(err),
       )
-      .then(() => this._activeStreams.delete(requestId));
+      .then(() => {
+        this._activeStreams.delete(requestId);
+        // The stream has ended: the file it was sent is done with.
+        upload.remove(sentFile);
+      });
 
     this._respond(requestId, { status: 'accepted', extra: { stream_topic: ctx.topic } });
   }
