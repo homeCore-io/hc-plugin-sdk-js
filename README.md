@@ -10,7 +10,7 @@ and capability actions.
 
 ## Installing
 
-Requires Node.js 18+.
+Requires Node.js 22 or later. In a homeCore Node.js plugin runtime, a plugin runs on the Node it was built for (24 or 26 today).
 
 ### Working inside the homeCore workspace
 

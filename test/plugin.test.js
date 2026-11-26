@@ -150,7 +150,7 @@ describe('PluginBase', () => {
     );
   });
 
-  test('publishStateForCommand preserves HomeCore command metadata', () => {
+  test('publishStateForCommand preserves homeCore command metadata', () => {
     const plugin = new TestPlugin();
     plugin.run();
     plugin.publishStateForCommand(

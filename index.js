@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * homecore-plugin-sdk — Node.js SDK for HomeCore device plugins.
+ * homecore-plugin-sdk — Node.js SDK for homeCore device plugins.
  *
  * @example
  * const { PluginBase } = require('homecore-plugin-sdk');
@@ -59,7 +59,7 @@ const SDK_VERSION = '0.4.6';
 const PROTOCOL_VERSION = '0.1.5';
 
 /**
- * Base class for HomeCore plugins written in Node.js.
+ * Base class for homeCore plugins written in Node.js.
  *
  * Subclasses must override {@link PluginBase#onCommand} and optionally
  * {@link PluginBase#onConnect}.  Call {@link PluginBase#run} to connect.
@@ -136,7 +136,7 @@ class PluginBase {
   /**
    * Publish a device state update (retained, QoS 1).
    *
-   * @param {string} deviceId - Canonical HomeCore device identifier.
+   * @param {string} deviceId - Canonical homeCore device identifier.
    * @param {object} state    - Attribute map to publish.
    * @param {object} [options] - Optional publish metadata.
    * @param {object} [options.change] - `_hc.change` payload describing provenance.
@@ -166,7 +166,7 @@ class PluginBase {
    * Register a device by type name.
    *
    * Instead of providing a full capability schema, supply a `deviceType` string
-   * that HomeCore resolves against its built-in device-type catalog.  This is the
+   * that homeCore resolves against its built-in device-type catalog.  This is the
    * recommended registration path for well-known device categories.
    *
    * Example types: `"light"`, `"switch"`, `"motion_sensor"`, `"contact_sensor"`,
@@ -186,7 +186,7 @@ class PluginBase {
   }
 
   /**
-   * Retire a device from HomeCore by clearing retained topics and publishing
+   * Retire a device from homeCore by clearing retained topics and publishing
    * a plugin-scoped unregister message.
    *
    * @param {string} deviceId - Stable unique device identifier.
@@ -299,7 +299,7 @@ class PluginBase {
    *
    * Use this for high-frequency sensors that send diffs rather than full state.
    *
-   * @param {string} deviceId - Canonical HomeCore device identifier.
+   * @param {string} deviceId - Canonical homeCore device identifier.
    * @param {object} patch    - Attributes to merge into the current state.
    * @param {object} [options] - Optional publish metadata.
    * @param {object} [options.change] - `_hc.change` payload describing provenance.
@@ -311,14 +311,14 @@ class PluginBase {
   }
 
   /**
-   * Publish a state update that is the direct result of a HomeCore command.
+   * Publish a state update that is the direct result of a homeCore command.
    *
    * This preserves `_hc.command` metadata as `_hc.change` so rules can tell the
-   * resulting state update came from HomeCore.
+   * resulting state update came from homeCore.
    *
-   * @param {string} deviceId - Canonical HomeCore device identifier.
+   * @param {string} deviceId - Canonical homeCore device identifier.
    * @param {object} state - Attribute map to publish.
-   * @param {object} commandPayload - Original HomeCore command payload.
+   * @param {object} commandPayload - Original homeCore command payload.
    * @param {string} [fallbackSource] - Source label if the command had no metadata.
    */
   publishStateForCommand(deviceId, state, commandPayload, fallbackSource = this.pluginId) {
@@ -328,11 +328,11 @@ class PluginBase {
   }
 
   /**
-   * Publish a partial state update that is the direct result of a HomeCore command.
+   * Publish a partial state update that is the direct result of a homeCore command.
    *
-   * @param {string} deviceId - Canonical HomeCore device identifier.
+   * @param {string} deviceId - Canonical homeCore device identifier.
    * @param {object} patch - Merge-patch payload to publish.
-   * @param {object} commandPayload - Original HomeCore command payload.
+   * @param {object} commandPayload - Original homeCore command payload.
    * @param {string} [fallbackSource] - Source label if the command had no metadata.
    */
   publishStatePartialForCommand(deviceId, patch, commandPayload, fallbackSource = this.pluginId) {
@@ -427,7 +427,7 @@ class PluginBase {
   /**
    * Publish a device capability schema (retained, QoS 1).
    *
-   * @param {string} deviceId - Canonical HomeCore device identifier.
+   * @param {string} deviceId - Canonical homeCore device identifier.
    * @param {object} schema   - Capability schema object.
    */
   registerDeviceSchema(deviceId, schema) {
@@ -831,7 +831,7 @@ class PluginBase {
   }
 
   /**
-   * Extract a HomeCore change record from an inbound command payload.
+   * Extract a homeCore change record from an inbound command payload.
    *
    * @param {object} commandPayload - Decoded JSON command payload.
    * @returns {object|null}
@@ -852,7 +852,7 @@ class PluginBase {
   }
 
   /**
-   * Resolve a command payload into a concrete HomeCore-originated change record.
+   * Resolve a command payload into a concrete homeCore-originated change record.
    *
    * @param {object} commandPayload - Decoded JSON command payload.
    * @param {string} [fallbackSource] - Source label if the command had no metadata.
