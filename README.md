@@ -382,6 +382,27 @@ An action declared with `requiresRole: RequiresRole.SIGNED_IN` can be called by
 anyone signed in, household members and read-only accounts included, so use
 `caller.scopes` to stay within what that person may do.
 
+### Files sent to an action
+
+A screen can send a file to an action (`host.upload(action, file, params)`, or
+`POST /plugins/{id}/upload/{action}`, up to 32 MiB). homeCore sends it in
+pieces; the SDK keeps them in a temporary file and runs the action with
+`file_path` in its params:
+
+```javascript
+async onAction(action, params) {
+  if (action === 'restore') {
+    const backup = fs.readFileSync(params.file_path);
+    return { restored: await this.restoreFrom(backup) };
+  }
+  return null;
+}
+```
+
+The file is removed once the action has replied, or, for a streaming action,
+once its stream has ended: copy it first to keep it. Other params arrive as
+strings. Needs homeCore 0.1.87 or later.
+
 ## REST access from homeCore
 
 A plugin that needs homeCore's REST API asks for scopes in its manifest, and
@@ -603,11 +624,9 @@ zombies with `DELETE /api/v1/plugins/{id}/devices`.
 
 Almost everything the Rust SDK does is here: registration, state, availability, the
 management protocol, log forwarding, notices, alerts, capability actions including
-streaming, cross-device state subscription, and the plugin's own screens.
-
-One thing is Rust-only so far: **files sent to an action** (`POST
-/plugins/{id}/upload/{action}`, which the Rust SDK receives as `upload_chunk`
-pieces and hands the action as `file_path`).
+streaming, cross-device state subscription, the plugin's own screens, and files
+sent to an action (from 0.4.7). The Rust SDK's pictures a plugin keeps
+(`with_files_dir`) and its asynchronous action handlers are not here yet.
 
 The whole process of building a plugin — screens and cards included — is in
 the homeCore repository's `docs/plugin-development.md`.
